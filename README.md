@@ -46,7 +46,7 @@ Everything is optional except Python tooling. Pick the row that matches what you
 
 ### 1. Prerequisites
 
-- **NVIDIA GPU and driver.** RTX 50-series cards need driver 580 or newer for the CUDA 13 PyTorch build. Older cards can use `--cuda cu126`. CPU-only works in principle and but is very, very slow.
+- **NVIDIA GPU and driver.** RTX 50-series cards need driver 580 or newer for the CUDA 13 PyTorch build. Older cards can use `--cuda cu126`. CPU-only works in principle but is very, very slow.
 - **[Git](https://git-scm.com)** and **[uv](https://docs.astral.sh/uv/getting-started/installation/)**. uv installs Python 3.12 for you, so you don't need Python yourself.
 - **ffmpeg** on PATH (video only). On Windows, `winget install Gyan.FFmpeg` works. On Linux, use your package manager.
 - **7-Zip** (manga only, optional). It's needed to read `.cbr`/`.rar` archives: `winget install 7zip.7zip`. On Linux just use `.zip`/`.cbz` archives.
@@ -79,7 +79,7 @@ The two environments use Python 3.12 on purpose:
 
 This project doesn't install, download or run the translation LLM. You bring an OpenAI-compatible server and tell `.env` where it is.
 
-**Recommended model: [TheDrummer/Artemis-31B-v1.2](https://huggingface.co/TheDrummer/Artemis-31B-v1.2)**, a Gemma 4 31B fine-tune designed for adult creative writing, is recommended. In side-by-side tests on video subtitles it beat Gemma4-31B, Qwen3.8-27B, and even dedicated Japanese translation models like Sugoi-32B. It was best at repairing speech-recognition mistakes and translating explicit language without softening it. For non-adult content any Gemma4-based model will work for translation and can be run on Bedrock, Runpod, etc. Smaller (9b) Gemma4 models run locally with will also work though they will not translate as well as a 31B or large model. 
+**Recommended model: [TheDrummer/Artemis-31B-v1.2](https://huggingface.co/TheDrummer/Artemis-31B-v1.2)**, a Gemma 4 31B fine-tune designed for adult creative writing. In side-by-side tests on video subtitles it beat Gemma4-31B, Qwen3.8-27B, and even dedicated Japanese translation models like Sugoi-32B. It was best at repairing speech-recognition mistakes and translating explicit language without softening it. For non-adult content any Gemma4-based model will work for translation and can be run on Bedrock, Runpod, etc. Smaller (9b) Gemma4 models run locally will also work though they will not translate as well as a 31B or large model. 
 
 Ways to run it:
 
@@ -134,7 +134,7 @@ Real environment variables override `.env`. Set `LJT_ENV_FILE` to use a differen
 3. **Check the options.** Run `jasna.exe --help` to confirm it works and to see every option.
 4. **Download the restoration model.** Run Jasna once with the model you want, in its GUI or with `--restoration-model-name`, so it can download the model.
    - The LTX models are large, and Jasna offers to download them when they're missing.
-   - LTX models models are "supporter" models that need a Jasna supporter license. Check Jasna's README for which ones, and for its terms. This said, they are **much** better, like NCIS "enhance!" made real.
+   - LTX models are "supporter" models that need a Jasna supporter license. Check Jasna's README for which ones, and for its terms. This said, they are **much** better, like NCIS "enhance!" made real.
    - If you can't use LTX, set `JASNA_ARGS=--restoration-model-name basicvsrpp` for the fast, free BasicVSR++ model.
 
 Choosing settings:
@@ -143,7 +143,7 @@ Choosing settings:
   - On an RTX 5090, a 2-hour video with little mosaic took about 75 minutes.
   - A 3.9-hour, heavily mosaicked video was estimated at 11+ hours.
 - **`--ltx-auto-split 30`:** for long videos with heavy mosaic. Mosaics at least 30% of the frame height get LTX, and smaller ones get BasicVSR++. That same 3.9-hour video took 1.4 hours.
-- **Only decensor censored originals.** it: Jasna looks for mosaics, and an earlier bad restoration isn't one. Running Jasna on a video that was already decensored badly by another tool or model will not fix it.
+- **Only decensor censored originals.**: Jasna looks for mosaics, and an earlier bad restoration isn't one. Running Jasna on a video that was already decensored badly by another tool or model will not fix it.
 - **Auto-split output:** it keeps the source codec, and restored parts are re-encoded at a high bitrate. An H.264 source can therefore come out larger than it went in, while full LTX runs write HEVC and usually shrink the file. Re-encode afterwards if size matters.
 
 ### 6. Chrome extension (manga only)
