@@ -19,8 +19,8 @@ How it works:
    3. Transcribing speech the first two passes missed, found with a VAD, on its own.
 
    Each audio version catches lines the other misses, so their results are merged.
-4. Cleanup filters for Whisper's known hallucinations: YouTube outro phrases, counting runs, repetition loops and nonverbal (vocal sounds) lines.
-5. Translation in batches of 30 lines, with the previous lines and the brief as context. Lines the model skips or mangles are retried one at a time.
+4. Cleanup filters for Whisper's known hallucinations: YouTube outro phrases, counting runs, repetition loops and nonverbal (vocal sounds) lines, Korean lines, known filler characters, etc.
+5. Smart LLM-based translation. A model reads the video title and entire transcript, writes a brief on the premise, the speakers and their genders, register and pronouns, recurring terms, words that keep getting misheard, etc. This is combined with a system prompt that tells it to expect ASR errors and infer likely meanings, translate each line on its own and never move words between lines, and to default to you/I/we rather than he/she when Japanese drops pronouns. This leads to much better video translation than naive Google Translate style word-by-word.
 6. ffmpeg mux.
 
 Timing on an RTX 5090, for a 2-hour video with the subtitles only: vocal separation ~3.5 min, transcription ~8 min per audio version, translation ~10 min with Artemis.
