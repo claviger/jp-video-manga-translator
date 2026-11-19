@@ -19,11 +19,15 @@ How it works:
    3. Transcribing speech the first two passes missed, found with a VAD, on its own.
 
    Each audio version catches lines the other misses, so their results are merged.
-4. Cleanup filters for Whisper's known hallucinations: YouTube outro phrases, counting runs, repetition loops and moan-only lines.
+4. Cleanup filters for Whisper's known hallucinations: YouTube outro phrases, counting runs, repetition loops and nonverbal (vocal sounds) lines.
 5. Translation in batches of 30 lines, with the previous lines and the brief as context. Lines the model skips or mangles are retried one at a time.
 6. ffmpeg mux.
 
 Timing on an RTX 5090, for a 2-hour video with the subtitles only: vocal separation ~3.5 min, transcription ~8 min per audio version, translation ~10 min with Artemis.
+
+This pipeline will actually work on non-Japanese media (both video & comics), but not nearly as well -- while the translation LLM used knows basically every language,
+none of the Whisper cleanup filters will work on other languages, and comic translation will have trouble with languages that aren't read right-to-left. It will probably
+not outperform other, existing translation pipelines if used on media that's not in Japanese.
 
 ## Which parts do you need?
 
