@@ -1,0 +1,12 @@
+# Video pipeline, Python 3.12. install.py installs torch from the PyTorch CUDA index first, then this file
+# with that index as an extra index. These pins are the combination tested on Windows 11 + RTX 5090.
+audio-separator[gpu]==0.48.0
+audioread
+faster-whisper==1.2.1
+# faster-whisper 1.2.1 passes metadata_errors= to av.open(), which PyAV 19 removed
+av==18.0.0
+ctranslate2==4.8.1
+# CUDA 12 cuBLAS/cuDNN for CTranslate2 (torch brings its own CUDA 13 libraries)
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+requests

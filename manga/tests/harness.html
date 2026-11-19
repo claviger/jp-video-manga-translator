@@ -1,0 +1,25 @@
+<!doctype html>
+<!-- Smoke test for extension/content.js outside Chrome's extension runtime: a stub chrome.runtime answers
+     "translate" with pre-rendered service output (tests/*.en.png). Serve the repo root and open /tests/harness.html. -->
+<html><head><meta charset="utf-8"><title>MLT harness</title>
+<style>body{background:#333;margin:0;padding:20px;text-align:center} img{display:block;margin:0 auto 30px;width:700px}</style>
+</head><body>
+<img src="test1.png" alt="page 1">
+<img src="test2.png" alt="page 2">
+<script>
+  window.__mltLog = [];
+  async function toDataUrl(u) {
+    const b = await (await fetch(u)).blob();
+    return await new Promise((res) => { const r = new FileReader(); r.onload = () => res(r.result); r.readAsDataURL(b); });
+  }
+  window.chrome = { runtime: { id: "harness",
+    sendMessage: async (msg) => {
+      window.__mltLog.push(msg);
+      await new Promise((r) => setTimeout(r, 300));
+      const name = msg.imgUrl.split("/").pop().replace(".png", ".en.png");
+      return { ok: true, key: msg.imgUrl, dataUrl: await toDataUrl(name), cache: "miss" };
+    },
+    onMessage: { addListener() {} } } };
+  addEventListener("load", () => { const s = document.createElement("script"); s.src = "../extension/content.js"; document.body.appendChild(s); });
+</script>
+</body></html>

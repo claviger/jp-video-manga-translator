@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+cache/
+models/
+result/
+.env
+service/token.txt
+samples/
+!.env.example
+.venv-manga/

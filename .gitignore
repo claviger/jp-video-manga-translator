@@ -1,0 +1,23 @@
+# Local config and secrets
+.env
+
+# Environments and downloaded models
+.venv*/
+models/
+__pycache__/
+*.pyc
+
+# Manga service runtime files
+manga/cache/
+manga/service/token.txt
+manga/samples/
+manga/result/
+manga/third_party/mit/result/
+
+# Video outputs if someone runs the pipeline inside the repo
+*.ja.srt
+*.en*.srt
+*.vocals.flac
+*.dossier.txt
+*.subbed.mkv
+*.restored.mp4

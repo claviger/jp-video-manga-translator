@@ -1,0 +1,4 @@
+[submodule "manga/third_party/mit"]
+	path = manga/third_party/mit
+	url = https://github.com/zyddnys/manga-image-translator.git
+	ignore = dirty

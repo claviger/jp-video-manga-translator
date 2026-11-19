@@ -1,0 +1,219 @@
+# jp-video-manga-translator
+
+Japanese-to-English translation and transcription pipeline for video and images (manga), running on your own hardware with a local LLM.
+
+- **Video:** takes a Japanese video and gives you an MKV with English subtitles and the Japanese transcript as a second subtitle track. For adult content with mosaic censorship, it can optionally decensor the video first with [Jasna](https://github.com/Kruk2/jasna).
+- **Manga:** a Chrome extension that puts a **Translate** button on manga pages and replaces each page with an English version typeset into the speech bubbles, plus a command-line tool for whole `.cbz`/`.zip`/`.cbr`/`.rar` archives.
+
+Translation goes to any OpenAI-compatible LLM server you run yourself (TabbyAPI, LM Studio, llama.cpp, vLLM, Ollama, ...) or a hosted API. Nothing goes to a third-party service unless you point it at one.
+
+> **Tested on:** Windows 11, git bash, an RTX 5090 (32 GB), NVIDIA driver 580+. Linux paths are written but untested. Other GPUs should work with the `cu126` PyTorch build but haven't been tried. Please open an issue if something breaks.
+
+How it works:
+
+1. Optional Jasna decensor.
+2. Vocal separation (Mel-Band RoFormer), so speech is easier to hear over noise.
+3. faster-whisper large-v3 on both the original and the vocals-only audio, each in three passes:
+   1. A batched pass over the whole file.
+   2. Re-decoding stretches where Whisper collapsed into one long junk line.
+   3. Transcribing speech the first two passes missed, found with a VAD, on its own.
+
+   Each audio version catches lines the other misses, so their results are merged.
+4. Cleanup filters for Whisper's known hallucinations: YouTube outro phrases, counting runs, repetition loops and moan-only lines.
+5. Translation in batches of 30 lines, with the previous lines and the brief as context. Lines the model skips or mangles are retried one at a time.
+6. ffmpeg mux.
+
+Timing on an RTX 5090, for a 2-hour video with the subtitles only: vocal separation ~3.5 min, transcription ~8 min per audio version, translation ~10 min with Artemis.
+
+## Which parts do you need?
+
+Everything is optional except Python tooling. Pick the row that matches what you want:
+
+| You want | Install | You also need |
+|---|---|---|
+| English subtitles for videos | `--video` | an LLM server, ffmpeg |
+| Japanese subtitles only (no translation) | `--video` | ffmpeg |
+| Decensored + English-subtitled videos | `--video` | an LLM server, ffmpeg, Jasna |
+| Manga translation in Chrome | `--manga` | an LLM server, Chrome |
+| Manga archives (.cbz/.zip) | `--manga` | an LLM server (7-Zip for .cbr/.rar) |
+| Everything | `--all` | all of the above |
+
+- **No Jasna?** The video tool subtitles videos as they are. Leave `JASNA_EXE` empty.
+- **No LLM yet?** `video.sh X.mp4 --transcribe-only` still writes the Japanese subtitles.
+- **Uncensored or already-decensored videos** just need `--skip-decensor` or `--restored`.
+
+## Install
+
+### 1. Prerequisites
+
+- **NVIDIA GPU and driver.** RTX 50-series cards need driver 580 or newer for the CUDA 13 PyTorch build. Older cards can use `--cuda cu126`. CPU-only works in principle and but is very, very slow.
+- **[Git](https://git-scm.com)** and **[uv](https://docs.astral.sh/uv/getting-started/installation/)**. uv installs Python 3.12 for you, so you don't need Python yourself.
+- **ffmpeg** on PATH (video only). On Windows, `winget install Gyan.FFmpeg` works. On Linux, use your package manager.
+- **7-Zip** (manga only, optional). It's needed to read `.cbr`/`.rar` archives: `winget install 7zip.7zip`. On Linux just use `.zip`/`.cbz` archives.
+- About 15 GB of disk: two Python environments with CUDA PyTorch (~5 GB each) and ~5 GB of models. The translation model (see below) is not included in this; it is a dependency.
+
+### 2. Clone and run the installer
+
+```bash
+git clone --recurse-submodules https://github.com/claviger/jp-video-manga-translator.git
+cd jp-video-manga-translator
+uv run install.py --all        # or --video, or --manga
+```
+
+The installer does the following, and is safe to re-run:
+
+- **Video:** creates `.venv-video` with PyTorch, faster-whisper and audio-separator, and downloads the Whisper large-v3 model (~3 GB) and the vocal-separation model (~900 MB).
+- **Manga:** checks out the [manga-image-translator](https://github.com/zyddnys/manga-image-translator) submodule, creates `.venv-manga`, and downloads its detection, OCR and inpainting models (~700 MB).
+- **Config:** copies `.env.example` to `.env`, then lists whatever you still need to do.
+
+Options:
+- `--cuda cu130|cu126|cpu` picks the PyTorch build. The default picks one from your NVIDIA driver.
+- `--no-models` skips the downloads; the models then download on first use.
+
+The two environments use Python 3.12 on purpose:
+- On 3.13, a manga dependency (`editdistance`) has no Windows wheel.
+- On 3.14, much of the torch stack has no Windows wheels.
+- `pydensecrf` is skipped because it needs the MSVC Build Tools to compile. The manga pipeline falls back to plain mask refinement without it.
+
+### 3. Translation model
+
+This project doesn't install, download or run the translation LLM. You bring an OpenAI-compatible server and tell `.env` where it is.
+
+**Recommended model: [TheDrummer/Artemis-31B-v1.2](https://huggingface.co/TheDrummer/Artemis-31B-v1.2)**, a Gemma 4 31B fine-tune designed for adult creative writing, is recommended. In side-by-side tests on video subtitles it beat Gemma4-31B, Qwen3.8-27B, and even dedicated Japanese translation models like Sugoi-32B. It was best at repairing speech-recognition mistakes and translating explicit language without softening it. For non-adult content any Gemma4-based model will work for translation and can be run on Bedrock, Runpod, etc. Smaller (9b) Gemma4 models run locally with will also work though they will not translate as well as a 31B or large model. 
+
+Ways to run it:
+
+- **LM Studio, llama.cpp or Ollama:** use a GGUF quant, e.g. [bartowski/TheDrummer_Artemis-31B-v1.2-GGUF](https://huggingface.co/bartowski/TheDrummer_Artemis-31B-v1.2-GGUF). Q5_K_M is a good fit for 24-32 GB of VRAM.
+- **TabbyAPI:** use an EXL3 quant of the same model (5-6 bpw for 32 GB VRAM.) Search Hugging Face for "Artemis-31B-v1.2 exl3".
+- **vLLM or a hosted API:** any instruct model that handles Japanese; Gemma4 models work best. Point `LLM_BASE_URL` at it.
+
+Things worth knowing:
+
+- **VRAM:** a 31B model at 5-6 bits takes ~20-24 GB, and the vision/speech models want a few GB more. If you are offloading the translation LLM to the cloud, 8 GB RAM is adequate for the other local models used.
+  - **Video:** the pipeline runs Jasna, Whisper and the LLM one after another, so on one 32 GB card that's fine. With `LLM_BACKEND=lmstudio` it also unloads the LLM during the GPU-heavy steps.
+  - **Manga:** the service keeps its models loaded while the LLM is too. Artemis 6bpw at 16k context plus the manga models used ~31.5 of 32.6 GB, so a 5bpw quant leaves more headroom.
+  - **Smaller GPU:** run the LLM on another machine and point `LLM_BASE_URL` there.
+- **Thinking models** (Qwen3, DeepSeek and others): set `LLM_REASONING_EFFORT=none` if your server supports it. In our tests, thinking added about 2,300 tokens per 30-line batch on Qwen3 and made DeepSeek about 50x slower per batch, for at most a small quality gain.
+- **Avoid role-play-tuned models:** despite being theoretically good at dialog, models with a built-in role-play system prompt (e.g. "Orthia" variants) get confused by bare subtitle lines.
+
+### 4. Configure `.env`
+
+Open `.env` (created by the installer from [.env.example](.env.example), which documents every setting). The ones that matter:
+
+```ini
+# The LLM server
+LLM_BASE_URL=http://localhost:5000/v1   # up to and including /v1
+LLM_MODEL=Artemis-31B-v1.2              # exactly as listed at <LLM_BASE_URL>/models
+LLM_API_KEY=                            # empty if your server has no auth; ${MY_TOKEN} reads an env var
+LLM_BACKEND=openai                      # openai | tabby | lmstudio (see below)
+
+# Video decensoring (optional)
+JASNA_EXE=C:\Tools\jasna\jasna.exe
+JASNA_ARGS=--restoration-model-name ltx-4step
+```
+
+`LLM_BACKEND` decides whether the tools manage the model for you:
+
+- `openai` (default): only sends requests. You load the model yourself. Works with every server.
+- `tabby`: for a TabbyAPI server that others may share.
+  - If `LLM_MODEL` is loaded, it's used.
+  - If nothing is loaded, the tools load it and unload it again when they're done. This needs an admin key.
+  - If a different model is loaded, the run stops instead of swapping it out. `LLM_USE_LOADED_MODEL=1` uses whatever is loaded instead.
+- `lmstudio`: LM Studio on the same machine. The tools load `LLM_MODEL` fully onto the GPU with the `lms` CLI, which avoids LM Studio's default of putting part of a big model on the CPU (10x slower).
+
+Real environment variables override `.env`. Set `LJT_ENV_FILE` to use a different file.
+
+### 5. Jasna (only for decensoring)
+
+[Jasna](https://github.com/Kruk2/jasna) is a separate program (AGPL-3.0) that restores mosaic-censored video. This project only calls its command-line interface.
+
+1. **Download.** Get the latest release from [github.com/Kruk2/jasna/releases](https://github.com/Kruk2/jasna/releases).
+   - On Windows with NVIDIA, that's `jasna-windows-<version>.7z.001` and `.002`. There are also Windows AMD and Linux NVIDIA/AMD packages.
+   - Download all parts of the archive into one folder and open the `.001` file with 7-Zip to extract it.
+2. **Point the tools at it.** Set `JASNA_EXE` in `.env` to the extracted `jasna.exe`.
+3. **Check the options.** Run `jasna.exe --help` to confirm it works and to see every option.
+4. **Download the restoration model.** Run Jasna once with the model you want, in its GUI or with `--restoration-model-name`, so it can download the model.
+   - The LTX models are large, and Jasna offers to download them when they're missing.
+   - LTX models models are "supporter" models that need a Jasna supporter license. Check Jasna's README for which ones, and for its terms. This said, they are **much** better, like NCIS "enhance!" made real.
+   - If you can't use LTX, set `JASNA_ARGS=--restoration-model-name basicvsrpp` for the fast, free BasicVSR++ model.
+
+Choosing settings:
+
+- **Default `JASNA_ARGS`:** `--restoration-model-name ltx-4step` matches the GUI's "LTX, Good quality".
+  - On an RTX 5090, a 2-hour video with little mosaic took about 75 minutes.
+  - A 3.9-hour, heavily mosaicked video was estimated at 11+ hours.
+- **`--ltx-auto-split 30`:** for long videos with heavy mosaic. Mosaics at least 30% of the frame height get LTX, and smaller ones get BasicVSR++. That same 3.9-hour video took 1.4 hours.
+- **Only decensor censored originals.** it: Jasna looks for mosaics, and an earlier bad restoration isn't one. Running Jasna on a video that was already decensored badly by another tool or model will not fix it.
+- **Auto-split output:** it keeps the source codec, and restored parts are re-encoded at a high bitrate. An H.264 source can therefore come out larger than it went in, while full LTX runs write HEVC and usually shrink the file. Re-encode afterwards if size matters.
+
+### 6. Chrome extension (manga only)
+
+1. Start the service and leave it running: `manga/run_service.sh`. It listens only on `127.0.0.1:8765`. On first start it writes a random access token to `manga/service/token.txt`.
+2. In Chrome, open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked** and pick the `manga/extension` folder.
+3. Open the extension's **Options**, paste the contents of `manga/service/token.txt`, and click **Save**. It should say "Service reachable".
+4. On a manga site, click the extension's toolbar icon, then **Enable on this site**. Chrome asks for access to that site and the sites its images come from.
+5. A **Translate** button appears on large images. Click it to translate the page, and click again to switch between the original and English. **Translate all pages in order** in the popup does a whole chapter, giving each page the previous one as context.
+
+Optional: set `MANGA_EXTENSION_ID` in `.env` to the ID shown on `chrome://extensions`, so the service only accepts requests from your copy of the extension.
+
+## Use
+
+### Video
+
+```bash
+./video.sh "E:/videos/ABC-123.mp4"                  # decensor (if JASNA_EXE is set), transcribe, translate, mux
+./video.sh "E:/videos/ABC-123.mp4" --skip-decensor  # subtitle as is
+./video.sh ABC-123.mp4 --restored ABC-123_restored.mp4   # you already decensored it in the Jasna GUI
+./video.sh ABC-123.mp4 --skip-decensor --transcribe-only # Japanese subtitles only, no LLM
+./video.sh --help                                   # all options
+```
+
+On Windows without git bash, use `video.cmd` the same way.
+
+Outputs, written next to the input:
+- `ABC-123.decensored.subbed.mkv`, or `ABC-123.subbed.mkv` when the video wasn't decensored. The video and audio are copied untouched. It has two subtitle tracks: **English**, the default, and **Japanese (ASR)**, the cleaned transcript.
+- `ABC-123.restored.mp4`: Jasna's output, if it ran.
+- `ABC-123.ja.srt`: the raw Japanese transcript. It's reused on later runs, so delete it to re-transcribe.
+- `ABC-123.en.srt`: the English subtitles.
+- `ABC-123.dossier.txt`: a short brief the LLM writes from a sample of the transcript before translating (setting, speakers, tone, recurring words it seems to mishear). It goes into every translation request and is reused on later runs. You can edit it.
+- `ABC-123.vocals.flac`: the separated vocals, reused on later runs.
+
+### Manga
+
+- **In the browser:** see [Chrome extension](#6-chrome-extension-manga-only) above.
+- **Archives:**
+  ```bash
+  manga/translate.sh "Some Book.cbz"                  # writes "Some Book (EN).cbz"
+  manga/translate.sh "Some Book.cbr" --format jpg     # .cbr/.rar need 7-Zip
+  manga/translate.sh page1.png page2.png              # single pages -> page1.en.png ...
+  ```
+
+The archive tool uses the running service if there is one, so the models aren't loaded twice. Without it, the tool runs the pipeline itself. Results are cached by image hash, so re-running after an interruption skips finished pages.
+
+[manga/README.md](manga/README.md) covers how it works, the security model, and known limitations, such as canvas-based readers.
+
+## Security notes
+
+- **The manga service listens only on 127.0.0.1 and requires a random token.** Binding to localhost alone isn't enough, because any web page can make your browser send requests to `127.0.0.1`. So the service also:
+  - sends no CORS headers;
+  - rejects unexpected `Host` headers, which blocks DNS rebinding;
+  - only accepts requests from Chrome extensions.
+- **The extension asks for access one site at a time.** Its only install-time host permission is the local service.
+- **Secrets:** `.env` is git-ignored, and keys can stay in your shell profile with `LLM_API_KEY=${MY_TOKEN}`.
+- **The token is stored in plaintext**, in `manga/service/token.txt` and in the extension's storage. Any process running as you can read it.
+
+## Repository layout
+
+```
+install.py        installer (stdlib only; run with `uv run install.py`)
+.env.example      every setting, documented
+video.sh / .cmd   video launcher
+video/            pipeline.py (the whole video pipeline), requirements.txt
+manga/            service/ (local FastAPI service), extension/ (MV3 Chrome extension), scripts/ (archive and
+                  single-image tools, model prefetch), tests/, third_party/mit (manga-image-translator, submodule)
+models/           downloaded speech/separation models (git-ignored; manga models go in manga/models)
+```
+
+## License
+
+GPL-3.0 (see [LICENSE](LICENSE)), because the manga part imports [manga-image-translator](https://github.com/zyddnys/manga-image-translator), which is GPL-3.0. Jasna is a separate program under its own license (AGPL-3.0, with some proprietary supporter models) and isn't included here. Model weights you download may have their own licenses.
