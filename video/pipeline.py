@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Decensor (Jasna, optional) -> transcribe Japanese (faster-whisper, with vocal separation) -> translate to English
-(any OpenAI-compatible LLM) -> mux an MKV with English and Japanese subtitle tracks.
+Existing subtitles first (OpenSubtitles, optional) -> decensor (Jasna, optional) -> transcribe Japanese
+(faster-whisper, with vocal separation) -> translate to English (any OpenAI-compatible LLM) -> mux an MKV with
+English and Japanese subtitle tracks. When OpenSubtitles has subtitles that sync well to this file's audio,
+transcription and translation are skipped (see opensubs.py).
 
 Usage (from anywhere; `video.sh` / `video.cmd` in the repo root run this with the right venv):
   video.sh input.mp4                                  # full pipeline: decensor, subtitle, mux
@@ -10,6 +12,9 @@ Usage (from anywhere; `video.sh` / `video.cmd` in the repo root run this with th
   video.sh X.restored.mp4 --skip-decensor            # resume from an earlier Jasna run
   video.sh X.mp4 --skip-decensor --transcribe-only   # Japanese subtitles only; no LLM needed
   video.sh X.mp4 --skip-decensor --model other-model --no-mux  # A/B a translation model
+  video.sh "Some.Movie.2001.1080p.mkv"               # existing English subs if OpenSubtitles has good ones
+  video.sh Show.S01E02.mkv --imdb tt1234567 --subs-lang fr   # name the episode, look for French subs
+  video.sh X.mp4 --no-opensubtitles                  # always transcribe and translate
 
 If <input>.ja.srt already exists it is reused instead of re-transcribing. Delete it to force a fresh transcript.
 A trailing ".restored" in the input name is ignored when naming outputs (X.restored.mp4 -> X.ja.srt).
@@ -93,6 +98,10 @@ TABBY_CACHE_MODE = os.environ.get("TABBY_CACHE_MODE", "8,8")
 # Sent as reasoning_effort when set. "none" turns thinking off on servers that honour it (LM Studio and several
 # hosted APIs; Qwen3.x went from ~2300 reasoning tokens per batch to 0). Leave unset for servers that reject it.
 REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "") or None
+# Existing subtitles first (video/opensubs.py): with OPENSUBTITLES_API_KEY set, OpenSubtitles is searched for
+# subtitles in SUBS_LANG before any speech recognition. The ASR + LLM path is the fallback, and it always writes
+# English, whatever SUBS_LANG is.
+SUBS_LANG = os.environ.get("SUBS_LANG", "en").strip().lower() or "en"
 REMOTE_RETRIES = 4  # attempts per request on network errors, 429 and 5xx
 
 # Context brief ("dossier"), adapted from NihonSub: before translating, the LLM reads the title and a sample of
@@ -845,6 +854,36 @@ def mux(video: Path, subs, out: Path):
     run(cmd + [out])
 
 
+def existing_subtitles(src: Path, base: str, args) -> list:
+    """Existing subtitles first: [(srt, iso639-2, title), ...] with the SUBS_LANG track first, or [] to fall back
+    to speech recognition. Synced files are cached as <name>.<lang>.opensubtitles.srt and reused on later runs."""
+    import opensubs
+
+    primary, primary_tag, primary_name = opensubs.lang_codes(args.subs_lang)
+    langs = [primary]
+    orig = None if args.no_original_subs else opensubs.audio_language(src)
+    if orig:
+        o_code, o_tag, o_name = opensubs.lang_codes(orig)
+        if o_code != primary:
+            langs.append(o_code)
+    names = {primary: (primary_tag, primary_name)}
+    if len(langs) > 1:
+        names[langs[1]] = (o_tag, o_name)
+    cached = {lang: src.with_name(f"{base}.{lang}.opensubtitles.srt") for lang in langs}
+    if cached[primary].exists():
+        print(f"Reusing synced OpenSubtitles subtitles: {cached[primary]}", flush=True)
+    else:
+        found = opensubs.find_existing_subtitles(src, langs, args.imdb)
+        if primary not in found:
+            print(f"No well-synced {primary_name} subtitles on OpenSubtitles; transcribing instead.", flush=True)
+            return []
+        for lang, f in found.items():
+            cached[lang].write_text(f.srt_text, encoding="utf-8")
+            print(f"Wrote {cached[lang]} ({f.release}; {f.grade})", flush=True)
+    return [(cached[lang], names[lang][0], f"{names[lang][1]} (OpenSubtitles)")
+            for lang in langs if cached[lang].exists()]
+
+
 def main():
     global REASONING_EFFORT
     ap = argparse.ArgumentParser(description="Decensor (optional), transcribe, translate and subtitle a Japanese video.")
@@ -875,6 +914,15 @@ def main():
                     help="skip vocal separation; transcribe the original audio only")
     ap.add_argument("--batch-size", type=int, default=BATCH_SIZE,
                     help=f"lines per translation request (default: {BATCH_SIZE})")
+    ap.add_argument("--no-opensubtitles", action="store_true",
+                    help="don't look for existing subtitles on OpenSubtitles; always transcribe and translate")
+    ap.add_argument("--subs-lang", default=SUBS_LANG,
+                    help="language of the default subtitle track to look for on OpenSubtitles, e.g. en, pt-br "
+                         f"(default: SUBS_LANG from .env, now {SUBS_LANG})")
+    ap.add_argument("--imdb", metavar="ID", help="IMDb id of the movie, or of the episode itself (not the show), "
+                                                 "e.g. tt1234567, for when the filename doesn't identify it")
+    ap.add_argument("--no-original-subs", action="store_true",
+                    help="with OpenSubtitles, don't also look for subtitles in the audio's own language")
     args = ap.parse_args()
 
     src = args.input.resolve()
@@ -889,8 +937,14 @@ def main():
     if args.reasoning and args.reasoning != "none" and args.reasoning != REASONING_EFFORT:
         en_srt = en_srt.with_name(en_srt.name.removesuffix(".srt") + f".reason-{args.reasoning}.srt")
     REASONING_EFFORT = args.reasoning
+
+    # Existing subtitles first. Skipped when the run is clearly about our own transcript or translation
+    # (--transcribe-only, --en-srt, --model A/B runs). The synced file is cached like ja.srt: delete it to search again.
+    os_tracks = []  # [(srt_path, iso639-2, title)] from OpenSubtitles
+    if not (args.no_opensubtitles or args.transcribe_only or args.en_srt or args.model):
+        os_tracks = existing_subtitles(src, base, args)
     # Fail on a missing LLM setting now, not after hours of decensoring and transcription
-    llm = None if (args.transcribe_only or args.en_srt) else make_llm(args.model)
+    llm = None if (args.transcribe_only or args.en_srt or os_tracks) else make_llm(args.model)
 
     skip_decensor = args.skip_decensor
     if not skip_decensor and not args.restored and not JASNA_EXE:
@@ -910,6 +964,21 @@ def main():
 
     if not restored.exists():
         sys.exit(f"Video not found: {restored}")
+
+    if os_tracks:
+        print("Using existing subtitles; skipping speech recognition and translation.", flush=True)
+        if args.no_mux:
+            return
+        final = args.output.resolve() if args.output else final
+        with tempfile.TemporaryDirectory() as tmp:
+            subs = list(os_tracks)
+            if ja_srt.exists() and not any(lang == "jpn" for _, lang, _ in subs):
+                ja_clean = Path(tmp) / "ja.srt"  # an earlier transcript of this file: add it, cleaned, as before
+                write_srt(clean_cues(read_srt(ja_srt)), ja_clean, "ja")
+                subs.append((ja_clean, "jpn", "Japanese (ASR)"))
+            mux(restored, subs, final)
+        print("Done:", final)
+        return
 
     if ja_srt.exists():
         print(f"Reusing existing transcript: {ja_srt}", flush=True)
@@ -943,7 +1012,7 @@ def main():
             if len(en) != len(cues) or any(abs(e["start"] - c["start"]) > 0.01 for e, c in zip(en, cues)):
                 sys.exit(f"{path} has {len(en)} cues that don't line up with the {len(cues)} cleaned JA cues; "
                          "it was made from a different transcript or cleanup.")
-            en_tracks.append((path, title or "English"))
+            en_tracks.append((path, title or "English (machine translation)"))
             print(f"Using existing English subtitles: {path}", flush=True)
     else:
         print(f"Translating with {llm.provider}: {llm.model}", flush=True)
@@ -963,7 +1032,7 @@ def main():
                 tabby_unload(llm)
         write_srt(cues, en_srt, "en")
         print("Wrote", en_srt, flush=True)
-        en_tracks.append((en_srt, "English"))
+        en_tracks.append((en_srt, "English (machine translation)"))
     if args.no_mux:
         return
 

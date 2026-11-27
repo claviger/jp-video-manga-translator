@@ -5,12 +5,13 @@ Japanese-to-English translation and transcription pipeline for video and images 
 - **Video:** takes a Japanese video and gives you an MKV with English subtitles and the Japanese transcript as a second subtitle track. For adult content with mosaic censorship, it can optionally decensor the video first with [Jasna](https://github.com/Kruk2/jasna).
 - **Manga:** a Chrome extension that puts a **Translate** button on manga pages and replaces each page with an English version typeset into the speech bubbles, plus a command-line tool for whole `.cbz`/`.zip`/`.cbr`/`.rar` archives.
 
-Translation goes to any OpenAI-compatible LLM server you run yourself (TabbyAPI, LM Studio, llama.cpp, vLLM, Ollama, ...) or a hosted API. Nothing goes to a third-party service unless you point it at one.
+Translation goes to any OpenAI-compatible LLM server you run yourself (TabbyAPI, LM Studio, llama.cpp, vLLM, Ollama, ...) or a hosted API. Nothing goes to a third-party service unless you point it at one. The one optional exception is the [existing subtitles](#existing-subtitles) lookup on OpenSubtitles, which only runs once you give it an API key.
 
 > **Tested on:** Windows 11, git bash, an RTX 5090 (32 GB), NVIDIA driver 580+. Linux paths are written but untested. Other GPUs should work with the `cu126` PyTorch build but haven't been tried. Please open an issue if something breaks.
 
 How it works:
 
+0. Optional: look for existing subtitles on OpenSubtitles, sync them to the audio and check the sync. If they pass, they're muxed and steps 2-5 are skipped ([Existing subtitles](#existing-subtitles)).
 1. Optional Jasna decensor.
 2. Vocal separation (Mel-Band RoFormer), so speech is easier to hear over noise.
 3. faster-whisper large-v3 on both the original and the vocals-only audio, each in three passes:
@@ -175,12 +176,43 @@ Optional: set `MANGA_EXTENSION_ID` in `.env` to the ID shown on `chrome://extens
 On Windows without git bash, use `video.cmd` the same way.
 
 Outputs, written next to the input:
-- `ABC-123.decensored.subbed.mkv`, or `ABC-123.subbed.mkv` when the video wasn't decensored. The video and audio are copied untouched. It has two subtitle tracks: **English**, the default, and **Japanese (ASR)**, the cleaned transcript.
+- `ABC-123.decensored.subbed.mkv`, or `ABC-123.subbed.mkv` when the video wasn't decensored. The video and audio are copied untouched. It has two subtitle tracks: **English (machine translation)**, the default, and **Japanese (ASR)**, the cleaned transcript. When existing subtitles were used (below), the tracks are **English (OpenSubtitles)** and, if found, the audio's own language from OpenSubtitles.
 - `ABC-123.restored.mp4`: Jasna's output, if it ran.
 - `ABC-123.ja.srt`: the raw Japanese transcript. It's reused on later runs, so delete it to re-transcribe.
 - `ABC-123.en.srt`: the English subtitles.
 - `ABC-123.dossier.txt`: a short brief the LLM writes from a sample of the transcript before translating (setting, speakers, tone, recurring words it seems to mishear). It goes into every translation request and is reused on later runs. You can edit it.
 - `ABC-123.vocals.flac`: the separated vocals, reused on later runs.
+- `Movie.en.opensubtitles.srt` (and e.g. `Movie.ja.opensubtitles.srt`): synced subtitles from OpenSubtitles, reused on later runs. Delete them to search again.
+
+### Existing subtitles
+
+For movies, TV and anime, someone has often already written good subtitles. With `OPENSUBTITLES_API_KEY` set in `.env`, the video tool checks [OpenSubtitles.com](https://www.opensubtitles.com) first. It only falls back to speech recognition and the LLM when nothing usable turns up.
+
+1. **Match.** It searches by the file's OpenSubtitles moviehash first, which only matches subtitles uploaded for this exact release. Then it searches by the title, year, season and episode that [guessit](https://github.com/guessit-io/guessit) reads from the filename, or by `--imdb tt1234567` if you pass one. Results for a different title or episode are thrown out. The rest are ranked by hash match, frame rate, release-name overlap with your file, download count and uploader trust. Filenames that look like a JAV product code (`ABC-123`) are only searched by hash, since guessit reads them as TV episodes.
+2. **Sync.** The best candidate is downloaded and synced to the audio with [ffsubsync](https://github.com/smacke/ffsubsync), which fixes constant offsets and frame-rate mismatches.
+3. **Check.** Silero VAD, a different speech detector from the one ffsubsync uses, finds speech in the audio. The sync passes when enough of the subtitle time falls on speech (`OPENSUBTITLES_MIN_OVERLAP`, default 40%) and that's clearly better than the same subtitles shifted by a few seconds (`OPENSUBTITLES_MIN_MARGIN`, default 8 points). The margin is what catches subtitles for the wrong film or cut. The numbers for each candidate are printed, before and after syncing.
+4. **Fall back.** If the check fails, the next candidate is tried (up to `OPENSUBTITLES_MAX_TRIES`, default 3), then speech recognition and translation as usual.
+
+How I calibrated the check, on The Lost Boys (1987) with its own embedded English SDH track as the known-good subtitles:
+
+| Test | Speech overlap | Margin | Result |
+|---|---|---|---|
+| Correct subtitles | 60% | +19 | pass |
+| Shifted 4.2 s, then synced | 60% | +19 | pass (ffsubsync found -4.14 s) |
+| Stretched 25/23.976 fps, then synced | 60% | +19 | pass (found x0.959) |
+| Another film's subtitles | 34% | +1 | rejected |
+
+ffsubsync's own score didn't separate these (the wrong film scored highest), which is why the separate check exists. On a 2-hour film the whole step, minus downloads, takes under a minute.
+
+If the audio stream is tagged with a language other than the one you asked for (e.g. `jpn` on an anime), subtitles in that language are fetched and synced too, as a second track. An earlier `.ja.srt` transcript of the file is added as **Japanese (ASR)**.
+
+Options: `--no-opensubtitles` skips the lookup for one run, `--subs-lang fr` (or `SUBS_LANG`) picks the language of the default track, and `--no-original-subs` skips the second track. The lookup is also skipped with `--transcribe-only`, `--en-srt` and `--model`, since those runs are about your own transcript or translation. The fallback always writes English.
+
+Quotas: OpenSubtitles allows 5 downloads per IP per day with only an API key, and 20 per day with a free account (`OPENSUBTITLES_USERNAME` / `OPENSUBTITLES_PASSWORD`). Each candidate tried counts; searches don't. Counters reset at midnight UTC. The login token is cached in `.cache/` for its 24-hour lifetime, because OpenSubtitles limits logins to 30 an hour.
+
+Get the API key from your OpenSubtitles profile, under **API consumers**. OpenSubtitles asks that every application use its own key.
+
+Limits: ffsubsync applies one offset to the whole file, so subtitles for a cut with scenes added or removed in the middle usually fail the check and fall back to transcription. Subtitles already embedded in your video file aren't used yet.
 
 ### Manga
 
@@ -204,6 +236,7 @@ The archive tool uses the running service if there is one, so the models aren't 
   - only accepts requests from Chrome extensions.
 - **The extension asks for access one site at a time.** Its only install-time host permission is the local service.
 - **Secrets:** `.env` is git-ignored, and keys can stay in your shell profile with `LLM_API_KEY=${MY_TOKEN}`.
+- **What OpenSubtitles sees** (only when `OPENSUBTITLES_API_KEY` is set): your API key, your login if you set one, your IP, each file's moviehash, and the title, year, season and episode guessed from its filename (not the filename itself). That's enough for them to know what's in your library. Use `--no-opensubtitles` for files you'd rather not look up. The cached login token in `.cache/opensubtitles-token.json` is plaintext, like the manga token.
 - **The token is stored in plaintext**, in `manga/service/token.txt` and in the extension's storage. Any process running as you can read it.
 
 ## Repository layout
