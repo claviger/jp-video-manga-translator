@@ -170,6 +170,7 @@ Optional: set `MANGA_EXTENSION_ID` in `.env` to the ID shown on `chrome://extens
 ./video.sh "E:/videos/ABC-123.mp4" --skip-decensor  # subtitle as is
 ./video.sh ABC-123.mp4 --restored ABC-123_restored.mp4   # you already decensored it in the Jasna GUI
 ./video.sh ABC-123.mp4 --skip-decensor --transcribe-only # Japanese subtitles only, no LLM
+./video.sh "Movie.mkv" --keep-subs                # also keep the subtitle tracks already in the file
 ./video.sh --help                                   # all options
 ```
 
@@ -212,7 +213,9 @@ Quotas: OpenSubtitles allows 5 downloads per IP per day with only an API key, an
 
 Get the API key from your OpenSubtitles profile, under **API consumers**. OpenSubtitles asks that every application use its own key.
 
-Limits: ffsubsync applies one offset to the whole file, so subtitles for a cut with scenes added or removed in the middle usually fail the check and fall back to transcription. Subtitles already embedded in your video file aren't used yet.
+Subtitle tracks already in your video are dropped from the output, since you're subtitling it because they weren't good enough. Pass `--keep-subs` to keep them after the new tracks, not as the default.
+
+Limits: ffsubsync applies one offset to the whole file, so subtitles for a cut with scenes added or removed in the middle usually fail the check and fall back to transcription.
 
 ### Manga
 

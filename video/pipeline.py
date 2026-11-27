@@ -839,18 +839,36 @@ def translate(cues, llm: LLM, batch_size: int, dossier: str | None = None):
 
 
 # ---------------- mux ----------------
-def mux(video: Path, subs, out: Path):
-    """subs: [(srt_path, language, title), ...]; the first track is the default."""
+def subtitle_codecs(video: Path) -> list[str]:
+    """Codec names of the subtitle streams already in `video`, in order."""
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "s", "-show_entries", "stream=codec_name",
+                        "-of", "csv=p=0", str(video)], capture_output=True, text=True)
+    return [c.strip() for c in r.stdout.splitlines() if c.strip()]
+
+
+def mux(video: Path, subs, out: Path, keep_existing: bool = False):
+    """subs: [(srt_path, language, title), ...]; the first track is the default.
+    keep_existing: also copy the video's own subtitle tracks, after ours and not default. Their language and title
+    tags carry over. MP4 text subtitles (mov_text) can't go into MKV as is, so those become SRT; everything else,
+    including bitmap PGS/VobSub tracks, is copied untouched."""
+    existing = subtitle_codecs(video) if keep_existing else []
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", "-i", video]
     for path, _, _ in subs:
         cmd += ["-i", path]
     cmd += ["-map", "0:v", "-map", "0:a?"]
     for k in range(len(subs)):
         cmd += ["-map", str(k + 1)]
-    cmd += ["-c:v", "copy", "-c:a", "copy", "-c:s", "srt"]
+    if existing:
+        cmd += ["-map", "0:s"]
+    cmd += ["-c:v", "copy", "-c:a", "copy"]
     for k, (_, lang, title) in enumerate(subs):
-        cmd += [f"-metadata:s:s:{k}", f"language={lang}", f"-metadata:s:s:{k}", f"title={title}",
+        cmd += [f"-c:s:{k}", "srt", f"-metadata:s:s:{k}", f"language={lang}", f"-metadata:s:s:{k}", f"title={title}",
                 f"-disposition:s:{k}", "default" if k == 0 else "0"]
+    for j, codec in enumerate(existing, start=len(subs)):
+        cmd += [f"-c:s:{j}", "srt" if codec == "mov_text" else "copy", f"-disposition:s:{j}", "0"]
+    if keep_existing:
+        print(f"Keeping {len(existing)} subtitle track(s) already in the video" if existing else
+              "Note: --keep-subs, but the video has no subtitle tracks of its own", flush=True)
     run(cmd + [out])
 
 
@@ -900,6 +918,9 @@ def main():
     ap.add_argument("--title", help="video title for the context brief (default: guessed from a sibling file "
                                     "like '[CODE] Title.mp4')")
     ap.add_argument("--no-mux", action="store_true", help="stop after writing the English SRT")
+    ap.add_argument("--keep-subs", action="store_true",
+                    help="keep the video's own subtitle tracks in the output, after the new ones (default: drop "
+                         "them, since you're subtitling it because they weren't good enough)")
     ap.add_argument("--en-srt", action="append", metavar="PATH[=TITLE]",
                     help="mux this existing English SRT (e.g. from an A/B run) instead of translating; repeat it "
                          "to mux several English tracks for comparison, e.g. --en-srt a.srt='English (Artemis)'")
@@ -977,7 +998,7 @@ def main():
                 ja_clean = Path(tmp) / "ja.srt"  # an earlier transcript of this file: add it, cleaned, as before
                 write_srt(clean_cues(read_srt(ja_srt)), ja_clean, "ja")
                 subs.append((ja_clean, "jpn", "Japanese (ASR)"))
-            mux(restored, subs, final)
+            mux(restored, subs, final, args.keep_subs)
         print("Done:", final)
         return
 
@@ -1043,7 +1064,7 @@ def main():
         ja_clean = Path(tmp) / "ja.srt"
         write_srt(cues, ja_clean, "ja")
         subs = [(p_, "eng", t) for p_, t in en_tracks] + [(ja_clean, "jpn", "Japanese (ASR)")]
-        mux(restored, subs, final)
+        mux(restored, subs, final, args.keep_subs)
     print("Done:", final)
 
 
