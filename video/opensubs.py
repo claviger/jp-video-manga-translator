@@ -84,7 +84,9 @@ class Identity:
     def describe(self) -> str:
         if self.imdb_id:
             return f"IMDb tt{self.imdb_id:07d}"
-        s = self.title or "?"
+        if not self.title:
+            return "the filename (not searched: no usable title)"
+        s = self.title
         if self.year:
             s += f" ({self.year})"
         if self.kind == "episode":
