@@ -43,9 +43,9 @@ Everything is optional except Python tooling. Pick the row that matches what you
 | Manga archives (.cbz/.zip) | `--manga` | an LLM server (7-Zip for .cbr/.rar) |
 | Everything | `--all` | all of the above |
 
-- **No Jasna?** The video tool subtitles videos as they are. Leave `JASNA_EXE` empty.
-- **No LLM yet?** `video.sh X.mp4 --transcribe-only` still writes the Japanese subtitles.
-- **Uncensored or already-decensored videos** just need `--skip-decensor` or `--restored`.
+- **No Jasna?** Just don't pass `--decensor`. Decensoring only happens when you ask for it.
+- **No LLM yet?** `video.sh X.mp4 --asr` still writes the Japanese subtitles.
+- **Already decensored elsewhere** (e.g. the Jasna GUI)? Pass the decensored file as the input, or the original plus `--restored decensored.mp4`.
 
 ## Install
 
@@ -165,25 +165,59 @@ Optional: set `MANGA_EXTENSION_ID` in `.env` to the ID shown on `chrome://extens
 
 ### Video
 
+The video tool does a set of independent steps. Name any combination of them; with none, `--subs` is assumed.
+
+| Step | What it does |
+|---|---|
+| `--decensor` | Jasna mosaic restoration (needs `JASNA_EXE`) |
+| `--opensubs` | existing subtitles from OpenSubtitles, synced to the audio (needs `OPENSUBTITLES_API_KEY`; see below) |
+| `--asr` | Japanese subtitles by speech recognition |
+| `--translate` | English subtitles by LLM translation of the best Japanese source: this run's `--asr`, an earlier transcript of the file, Japanese subtitles from OpenSubtitles, or a Japanese text track already in the video |
+| `--convert` | write the output as `--format mkv` (default) or `mp4`. `--reencode hevc\|h264\|av1` also re-encodes the video (NVENC if your ffmpeg has it, else the CPU), with `--cq` for quality. Either option implies `--convert`. |
+| `--subs` | smart subtitles: OpenSubtitles if it has subtitles that sync well, otherwise `--asr` + `--translate` |
+
 ```bash
-./video.sh "E:/videos/ABC-123.mp4"                  # decensor (if JASNA_EXE is set), transcribe, translate, mux
-./video.sh "E:/videos/ABC-123.mp4" --skip-decensor  # subtitle as is
-./video.sh ABC-123.mp4 --restored ABC-123_restored.mp4   # you already decensored it in the Jasna GUI
-./video.sh ABC-123.mp4 --skip-decensor --transcribe-only # Japanese subtitles only, no LLM
-./video.sh "Movie.mkv" --keep-subs                # also keep the subtitle tracks already in the file
-./video.sh --help                                   # all options
+./video.sh movie.mkv                                # smart subtitles
+./video.sh ABC-123.mp4 --decensor --subs            # decensor, then smart subtitles
+./video.sh ABC-123.mp4 --decensor                   # decensor only -> ABC-123.decensored.mp4
+./video.sh ABC-123.mp4 --asr --translate            # always transcribe and translate
+./video.sh anime.mkv --translate                    # translate the Japanese track already in the file
+./video.sh old.avi --reencode hevc                  # convert to an HEVC MKV, nothing else
+./video.sh ABC-123.mp4 --decensor --asr --translate --reencode hevc --format mp4   # all of it at once
+./video.sh --help                                   # every option, with examples
 ```
 
-On Windows without git bash, use `video.cmd` the same way.
+Inputs and outputs:
 
-Outputs, written next to the input:
-- `ABC-123.decensored.subbed.mkv`, or `ABC-123.subbed.mkv` when the video wasn't decensored. The video and audio are copied untouched. It has two subtitle tracks: **English (machine translation)**, the default, and **Japanese (ASR)**, the cleaned transcript. When existing subtitles were used (below), the tracks are **English (OpenSubtitles)** and, if found, the audio's own language from OpenSubtitles.
-- `ABC-123.restored.mp4`: Jasna's output, if it ran.
-- `ABC-123.ja.srt`: the raw Japanese transcript. It's reused on later runs, so delete it to re-transcribe.
+```bash
+./video.sh "E:/incoming"                            # every video in the folder
+./video.sh "E:/incoming" -r --ext mkv,mp4           # include subfolders; only .mkv and .mp4
+./video.sh "E:/incoming" -r --out-dir "F:/done"     # write to F:/done, mirroring the folder structure
+./video.sh "E:/incoming" -r --out-dir "F:/done" --flatten   # everything directly in F:/done
+```
+
+- **Inputs:** you can mix files and folders. Folders are scanned one level deep unless you pass `-r`, and files this tool wrote itself (`.subbed.mkv`, `.restored.mp4`, ...) are skipped.
+- **Outputs:** written next to each input unless `--out-dir` is given.
+  - With `--flatten`, two inputs that would produce the same output name are caught before anything starts.
+  - A file whose output already exists is skipped, so you can re-run a batch after stopping it. `--overwrite` redoes them.
+- **Batches:** one failed file doesn't stop the batch. A summary at the end lists what was done, skipped and failed, and the exit code is 1 if anything failed.
+- **Windows without git bash:** use `video.cmd` the same way.
+
+The output is `ABC-123.decensored.subbed.mkv`, or without `.decensored` / `.subbed` when those steps didn't happen. Video and audio are copied untouched unless you `--reencode`. Subtitle tracks, in order:
+- **English (OpenSubtitles)**, if it was used. It's the default track.
+- **English (machine translation)**. It's the default when there's no OpenSubtitles track.
+- **Japanese (ASR)**, the cleaned transcript.
+- A track in the audio's own language from OpenSubtitles, if one was found.
+
+**Intermediate files** are written next to the output and reused if they're already there:
+- `ABC-123.restored.mp4`: Jasna's output.
+- `ABC-123.vocals.flac`: the separated vocals.
+- `ABC-123.ja.srt`: the raw Japanese transcript.
 - `ABC-123.en.srt`: the English subtitles.
-- `ABC-123.dossier.txt`: a short brief the LLM writes from a sample of the transcript before translating (setting, speakers, tone, recurring words it seems to mishear). It goes into every translation request and is reused on later runs. You can edit it.
-- `ABC-123.vocals.flac`: the separated vocals, reused on later runs.
-- `Movie.en.opensubtitles.srt` (and e.g. `Movie.ja.opensubtitles.srt`): synced subtitles from OpenSubtitles, reused on later runs. Delete them to search again.
+- `ABC-123.dossier.txt`: the context brief the LLM writes before translating (setting, speakers, tone, words it seems to mishear). You can edit it.
+- `ABC-123.en.opensubtitles.srt`: the synced OpenSubtitles download.
+
+They're deleted once a file succeeds, leaving only the final video. When a file fails, they're kept, so running the same command again picks up where it stopped. `--keep-intermediates` always keeps them, and `--no-mux` makes the subtitle files themselves the output instead of a video.
 
 ### Existing subtitles
 
@@ -207,7 +241,7 @@ ffsubsync's own score didn't separate these (the wrong film scored highest), whi
 
 If the audio stream is tagged with a language other than the one you asked for (e.g. `jpn` on an anime), subtitles in that language are fetched and synced too, as a second track. An earlier `.ja.srt` transcript of the file is added as **Japanese (ASR)**.
 
-Options: `--no-opensubtitles` skips the lookup for one run, `--subs-lang fr` (or `SUBS_LANG`) picks the language of the default track, and `--no-original-subs` skips the second track. The lookup is also skipped with `--transcribe-only`, `--en-srt` and `--model`, since those runs are about your own transcript or translation. The fallback always writes English.
+The lookup runs with `--subs` (the default) or `--opensubs`. `--asr --translate` skips it. `--subs-lang fr` (or `SUBS_LANG`) picks the language of the default track, and `--no-original-subs` skips the second track. The translation fallback always writes English.
 
 Quotas: OpenSubtitles allows 5 downloads per IP per day with only an API key, and 20 per day with a free account (`OPENSUBTITLES_USERNAME` / `OPENSUBTITLES_PASSWORD`). Each candidate tried counts; searches don't. Counters reset at midnight UTC. The login token is cached in `.cache/` for its 24-hour lifetime, because OpenSubtitles limits logins to 30 an hour.
 
@@ -239,7 +273,7 @@ The archive tool uses the running service if there is one, so the models aren't 
   - only accepts requests from Chrome extensions.
 - **The extension asks for access one site at a time.** Its only install-time host permission is the local service.
 - **Secrets:** `.env` is git-ignored, and keys can stay in your shell profile with `LLM_API_KEY=${MY_TOKEN}`.
-- **What OpenSubtitles sees** (only when `OPENSUBTITLES_API_KEY` is set): your API key, your login if you set one, your IP, each file's moviehash, and the title, year, season and episode guessed from its filename (not the filename itself). That's enough for them to know what's in your library. Use `--no-opensubtitles` for files you'd rather not look up. The cached login token in `.cache/opensubtitles-token.json` is plaintext, like the manga token.
+- **What OpenSubtitles sees** (only when `OPENSUBTITLES_API_KEY` is set): your API key, your login if you set one, your IP, each file's moviehash, and the title, year, season and episode guessed from its filename (not the filename itself). That's enough for them to know what's in your library. Use `--asr --translate` instead of `--subs` for files you'd rather not look up. The cached login token in `.cache/opensubtitles-token.json` is plaintext, like the manga token.
 - **The token is stored in plaintext**, in `manga/service/token.txt` and in the extension's storage. Any process running as you can read it.
 
 ## Repository layout

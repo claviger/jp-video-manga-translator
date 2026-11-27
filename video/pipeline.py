@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
 """
-Existing subtitles first (OpenSubtitles, optional) -> decensor (Jasna, optional) -> transcribe Japanese
-(faster-whisper, with vocal separation) -> translate to English (any OpenAI-compatible LLM) -> mux an MKV with
-English and Japanese subtitle tracks. When OpenSubtitles has subtitles that sync well to this file's audio,
-transcription and translation are skipped (see opensubs.py).
+Video processing for a whole collection. Independent steps; combine any of them in one command:
+  --decensor   Jasna mosaic restoration
+  --opensubs   existing subtitles from OpenSubtitles, synced to the file's audio (see opensubs.py)
+  --asr        Japanese subtitles by speech recognition (faster-whisper with vocal separation)
+  --translate  English subtitles by LLM translation of the best Japanese source available
+  --convert    output container (--format mkv|mp4) and optional re-encode (--reencode hevc|h264|av1)
+  --subs       smart subtitles: OpenSubtitles if it syncs well, else --asr + --translate (default with no step)
+Inputs can be files or folders (-r recurses, --ext filters). Outputs go next to each input or to --out-dir
+(mirrored structure, or --flatten). Run `video.sh --help` for examples.
 
-Usage (from anywhere; `video.sh` / `video.cmd` in the repo root run this with the right venv):
-  video.sh input.mp4                                  # full pipeline: decensor, subtitle, mux
-  video.sh input.mp4 --skip-decensor                  # subtitle the video as is
-  video.sh input.mp4 --restored "E:/x/input_restored.mkv"  # already decensored elsewhere (e.g. the Jasna GUI)
-  video.sh X.restored.mp4 --skip-decensor            # resume from an earlier Jasna run
-  video.sh X.mp4 --skip-decensor --transcribe-only   # Japanese subtitles only; no LLM needed
-  video.sh X.mp4 --skip-decensor --model other-model --no-mux  # A/B a translation model
-  video.sh "Some.Movie.2001.1080p.mkv"               # existing English subs if OpenSubtitles has good ones
-  video.sh Show.S01E02.mkv --imdb tt1234567 --subs-lang fr   # name the episode, look for French subs
-  video.sh X.mp4 --no-opensubtitles                  # always transcribe and translate
-
-If <input>.ja.srt already exists it is reused instead of re-transcribing. Delete it to force a fresh transcript.
+Intermediates (decensored video, vocals, raw transcript <name>.ja.srt, context brief, synced subtitles) are
+written next to the output and reused if present, deleted when a file succeeds (--keep-intermediates keeps them)
+and kept when it fails, so re-running resumes. The raw ja.srt gets the cleanup filters on every load.
 A trailing ".restored" in the input name is ignored when naming outputs (X.restored.mp4 -> X.ja.srt).
-The cached ja.srt is raw Whisper output; cleanup filters (e.g. counting hallucinations) run on every load.
 
 Settings come from the repo's .env file (see .env.example): LLM_BASE_URL, LLM_MODEL, LLM_API_KEY, LLM_BACKEND,
 JASNA_EXE, JASNA_ARGS and a few optional ones. Real environment variables override the file.
@@ -239,8 +234,8 @@ def free_vram_for_jasna():
 
 def decensor(src: Path, dst: Path):
     if not JASNA_EXE or not Path(JASNA_EXE).is_file():
-        sys.exit("Decensoring needs Jasna: set JASNA_EXE in .env to jasna.exe (see README, 'Jasna'), or pass "
-                 "--skip-decensor to subtitle the video as it is.")
+        sys.exit("Decensoring needs Jasna: set JASNA_EXE in .env to jasna.exe (see README, 'Jasna'), or leave out "
+                 "--decensor.")
     run([JASNA_EXE, "--input", src, "--output", dst, *JASNA_EXTRA_ARGS])
     if not dst.exists():
         sys.exit(f"Jasna finished but {dst} was not found. Check Jasna's log and output naming.")
@@ -699,7 +694,7 @@ def make_llm(model: str | None) -> LLM:
     if missing:
         where = f"in {ENV_FILE}" if ENV_FILE else f"in a .env file (copy {REPO_ROOT / '.env.example'} to .env)"
         sys.exit(f"Translation needs {' and '.join(missing)}: set {'them' if len(missing) > 1 else 'it'} {where}. "
-                 "To make Japanese subtitles only, pass --transcribe-only.")
+                 "To make Japanese subtitles only, use --asr without --translate.")
     return LLM(LLM_BASE_URL, os.environ.get("LLM_API_KEY", ""), model or LLM_MODEL, LLM_BACKEND)
 
 
@@ -838,63 +833,144 @@ def translate(cues, llm: LLM, batch_size: int, dossier: str | None = None):
         print(f"translated {min(b + batch_size, len(cues))}/{len(cues)} ({time.time() - t0:.0f}s)", flush=True)
 
 
-# ---------------- mux ----------------
-def subtitle_codecs(video: Path) -> list[str]:
-    """Codec names of the subtitle streams already in `video`, in order."""
-    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "s", "-show_entries", "stream=codec_name",
-                        "-of", "csv=p=0", str(video)], capture_output=True, text=True)
-    return [c.strip() for c in r.stdout.splitlines() if c.strip()]
+# ---------------- mux / convert ----------------
+TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
+VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".wmv", ".mov", ".m4v", ".ts", ".m2ts", ".mts", ".webm", ".flv", ".mpg",
+              ".mpeg", ".vob", ".3gp"}
+# Stems of files this tool writes; skipped when scanning folders so a second run doesn't process its own output
+OUTPUT_STEM_SUFFIXES = (".restored", ".decensored", ".subbed", ".converted")
+PARTIAL = ".ljt-partial"  # marks an output still being written
+
+# --reencode: (NVENC encoder, its args, software fallback, its args). The CQ/CRF value is the last arg of each.
+# The NVENC HEVC settings re-encoded a 3.9 h H.264 auto-split restore from 7.6 GB to 4.6 GB in 15 min (RTX 5090).
+ENCODERS = {
+    "hevc": ("hevc_nvenc", ["-preset", "p5", "-tune", "hq", "-profile:v", "main10", "-pix_fmt", "p010le",
+                            "-rc", "vbr", "-b:v", "0", "-spatial-aq", "1", "-temporal-aq", "1", "-rc-lookahead", "32",
+                            "-bf", "4", "-b_ref_mode", "middle", "-g", "250", "-cq", "28"],
+             "libx265", ["-preset", "medium", "-pix_fmt", "yuv420p10le", "-crf", "22"]),
+    "h264": ("h264_nvenc", ["-preset", "p5", "-tune", "hq", "-profile:v", "high", "-pix_fmt", "yuv420p",
+                            "-rc", "vbr", "-b:v", "0", "-spatial-aq", "1", "-rc-lookahead", "32", "-g", "250",
+                            "-cq", "23"],
+             "libx264", ["-preset", "medium", "-pix_fmt", "yuv420p", "-crf", "20"]),
+    "av1": ("av1_nvenc", ["-preset", "p5", "-tune", "hq", "-pix_fmt", "p010le", "-rc", "vbr", "-b:v", "0",
+                          "-spatial-aq", "1", "-rc-lookahead", "32", "-g", "250", "-cq", "32"],
+            "libsvtav1", ["-preset", "6", "-pix_fmt", "yuv420p10le", "-crf", "30"]),
+}
+_ffmpeg_encoders: set[str] | None = None
 
 
-def mux(video: Path, subs, out: Path, keep_existing: bool = False):
-    """subs: [(srt_path, language, title), ...]; the first track is the default.
-    keep_existing: also copy the video's own subtitle tracks, after ours and not default. Their language and title
-    tags carry over. MP4 text subtitles (mov_text) can't go into MKV as is, so those become SRT; everything else,
-    including bitmap PGS/VobSub tracks, is copied untouched."""
-    existing = subtitle_codecs(video) if keep_existing else []
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", "-i", video]
+def video_encode_args(codec: str, cq: int | None) -> list[str]:
+    global _ffmpeg_encoders
+    if _ffmpeg_encoders is None:
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True)
+        _ffmpeg_encoders = {ln.split()[1] for ln in r.stdout.splitlines() if len(ln.split()) > 1}
+    nv, nv_args, sw, sw_args = ENCODERS[codec]
+    enc, args = (nv, list(nv_args)) if nv in _ffmpeg_encoders else (sw, list(sw_args))
+    if enc == sw:
+        print(f"Note: {nv} isn't available in this ffmpeg; encoding with {sw} on the CPU (much slower).", flush=True)
+    if cq is not None:
+        args[-1] = str(cq)
+    return ["-c:v", enc, *args]
+
+
+def subtitle_streams(video: Path) -> list[dict]:
+    """[{codec, language}] for the subtitle streams in `video`, in order."""
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "s", "-show_entries",
+                        "stream=codec_name:stream_tags=language", "-of", "json", str(video)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    try:
+        streams = json.loads(r.stdout or "{}").get("streams", [])
+    except json.JSONDecodeError:
+        streams = []
+    return [{"codec": s.get("codec_name", ""), "language": (s.get("tags") or {}).get("language", "").lower()}
+            for s in streams]
+
+
+def mux(video: Path, subs, out: Path, keep_existing: bool = False, existing_from: Path | None = None,
+        fmt: str = "mkv", reencode: str | None = None, cq: int | None = None):
+    """Write `out` from `video` plus subs [(srt_path, language, title), ...]; the first sub is the default track.
+    keep_existing: also carry over the subtitle tracks of `existing_from` (default `video`), after ours and never
+    default, with their language/title tags. fmt: mkv or mp4 (mp4 holds text subtitles as mov_text and can't hold
+    bitmap PGS/VobSub tracks, which are dropped with a note). reencode: hevc/h264/av1, or None to copy the video."""
+    existing_from = existing_from or video
+    existing = subtitle_streams(existing_from) if keep_existing else []
+    sub_codec = "mov_text" if fmt == "mp4" else "srt"
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-stats", "-y", "-i", video]
     for path, _, _ in subs:
         cmd += ["-i", path]
-    cmd += ["-map", "0:v", "-map", "0:a?"]
+    ex_input = None
+    if existing:
+        if existing_from == video:
+            ex_input = 0
+        else:
+            ex_input = len(subs) + 1
+            cmd += ["-i", existing_from]
+    # 0:V (capital) leaves out attached pictures such as cover art, which a video encoder can't take
+    cmd += ["-map", "0:V" if reencode else "0:v", "-map", "0:a?"]
     for k in range(len(subs)):
         cmd += ["-map", str(k + 1)]
-    if existing:
-        cmd += ["-map", "0:s"]
-    cmd += ["-c:v", "copy", "-c:a", "copy"]
+    kept = []
+    for i, s in enumerate(existing):
+        if fmt == "mp4" and s["codec"] not in TEXT_SUB_CODECS:
+            print(f"Note: dropping existing {s['codec']} subtitle track {i} (bitmap subtitles can't go in MP4)",
+                  flush=True)
+            continue
+        cmd += ["-map", f"{ex_input}:s:{i}"]
+        kept.append(s)
+    cmd += video_encode_args(reencode, cq) if reencode else ["-c:v", "copy"]
+    cmd += ["-c:a", "copy"]
     for k, (_, lang, title) in enumerate(subs):
-        cmd += [f"-c:s:{k}", "srt", f"-metadata:s:s:{k}", f"language={lang}", f"-metadata:s:s:{k}", f"title={title}",
-                f"-disposition:s:{k}", "default" if k == 0 else "0"]
-    for j, codec in enumerate(existing, start=len(subs)):
-        cmd += [f"-c:s:{j}", "srt" if codec == "mov_text" else "copy", f"-disposition:s:{j}", "0"]
+        cmd += [f"-c:s:{k}", sub_codec, f"-metadata:s:s:{k}", f"language={lang}", f"-metadata:s:s:{k}",
+                f"title={title}", f"-disposition:s:{k}", "default" if k == 0 else "0"]
+    for j, s in enumerate(kept, start=len(subs)):
+        if fmt == "mp4":
+            codec = "mov_text"
+        else:
+            codec = "srt" if s["codec"] == "mov_text" else "copy"  # mov_text can't go into MKV as is
+        cmd += [f"-c:s:{j}", codec, f"-disposition:s:{j}", "0"]
     if keep_existing:
-        print(f"Keeping {len(existing)} subtitle track(s) already in the video" if existing else
-              "Note: --keep-subs, but the video has no subtitle tracks of its own", flush=True)
-    run(cmd + [out])
+        print(f"Keeping {len(kept)} subtitle track(s) already in the video" if kept else
+              "Note: --keep-subs, but the video has no subtitle tracks that can be kept", flush=True)
+    if fmt == "mp4":
+        cmd += ["-movflags", "+faststart"]
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.stem + PARTIAL + out.suffix)  # a killed run never leaves a half-written final file
+    run(cmd + [tmp])
+    os.replace(tmp, out)
 
 
-def existing_subtitles(src: Path, base: str, args) -> list:
-    """Existing subtitles first: [(srt, iso639-2, title), ...] with the SUBS_LANG track first, or [] to fall back
-    to speech recognition. Synced files are cached as <name>.<lang>.opensubtitles.srt and reused on later runs."""
+def extract_text_subs(video: Path, language: str, out: Path) -> bool:
+    """Write the first text subtitle track of `video` tagged `language` (ISO 639-2, e.g. jpn) to `out` as SRT."""
+    for i, s in enumerate(subtitle_streams(video)):
+        if s["language"] == language and s["codec"] in TEXT_SUB_CODECS:
+            r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video),
+                                "-map", f"0:s:{i}", "-c:s", "srt", str(out)], capture_output=True, text=True)
+            return r.returncode == 0 and out.exists() and out.stat().st_size > 0
+    return False
+
+
+def existing_subtitles(src: Path, base: str, work: Path, opts) -> list:
+    """OpenSubtitles: [(srt, iso639-2, title), ...] with the SUBS_LANG track first, or [] when nothing synced
+    well. Synced files are cached as <work>/<name>.<lang>.opensubtitles.srt and reused on later runs."""
     import opensubs
 
-    primary, primary_tag, primary_name = opensubs.lang_codes(args.subs_lang)
+    primary, primary_tag, primary_name = opensubs.lang_codes(opts.subs_lang)
     langs = [primary]
-    orig = None if args.no_original_subs else opensubs.audio_language(src)
+    orig = None if opts.no_original_subs else opensubs.audio_language(src)
+    names = {primary: (primary_tag, primary_name)}
     if orig:
         o_code, o_tag, o_name = opensubs.lang_codes(orig)
         if o_code != primary:
             langs.append(o_code)
-    names = {primary: (primary_tag, primary_name)}
-    if len(langs) > 1:
-        names[langs[1]] = (o_tag, o_name)
-    cached = {lang: src.with_name(f"{base}.{lang}.opensubtitles.srt") for lang in langs}
+            names[o_code] = (o_tag, o_name)
+    cached = {lang: work / f"{base}.{lang}.opensubtitles.srt" for lang in langs}
     if cached[primary].exists():
         print(f"Reusing synced OpenSubtitles subtitles: {cached[primary]}", flush=True)
     else:
-        found = opensubs.find_existing_subtitles(src, langs, args.imdb)
+        found = opensubs.find_existing_subtitles(src, langs, opts.imdb)
         if primary not in found:
             if os.environ.get("OPENSUBTITLES_API_KEY"):
-                print(f"No well-synced {primary_name} subtitles on OpenSubtitles; transcribing instead.", flush=True)
+                print(f"No well-synced {primary_name} subtitles on OpenSubtitles.", flush=True)
             return []
         for lang, f in found.items():
             cached[lang].write_text(f.srt_text, encoding="utf-8")
@@ -903,169 +979,469 @@ def existing_subtitles(src: Path, base: str, args) -> list:
             for lang in langs if cached[lang].exists()]
 
 
-def main():
-    global REASONING_EFFORT
-    ap = argparse.ArgumentParser(description="Decensor (optional), transcribe, translate and subtitle a Japanese video.")
-    ap.add_argument("input", type=Path)
-    ap.add_argument("--skip-decensor", action="store_true",
-                    help="don't run Jasna; use --restored if given, else the input file as is")
-    ap.add_argument("--restored", type=Path,
-                    help="an already-decensored video (e.g. from the Jasna GUI)")
-    ap.add_argument("--model", help="translation model id (default: LLM_MODEL from .env). With --model, EN subs go "
-                                    "to <name>.en.<model>.srt so A/B runs don't collide")
-    ap.add_argument("--no-dossier", action="store_true",
-                    help="translate without the context brief (<name>.dossier.txt); EN subs get a .nodossier tag")
-    ap.add_argument("--title", help="video title for the context brief (default: guessed from a sibling file "
-                                    "like '[CODE] Title.mp4')")
-    ap.add_argument("--no-mux", action="store_true", help="stop after writing the English SRT")
-    ap.add_argument("--keep-subs", action="store_true",
-                    help="keep the video's own subtitle tracks in the output, after the new ones (default: drop "
-                         "them, since you're subtitling it because they weren't good enough)")
-    ap.add_argument("--en-srt", action="append", metavar="PATH[=TITLE]",
-                    help="mux this existing English SRT (e.g. from an A/B run) instead of translating; repeat it "
-                         "to mux several English tracks for comparison, e.g. --en-srt a.srt='English (Artemis)'")
-    ap.add_argument("--output", type=Path, help="output MKV (default: <name>.decensored.subbed.mkv after "
-                                                "decensoring or with --restored, else <name>.subbed.mkv)")
-    ap.add_argument("--reasoning", default=REASONING_EFFORT,
-                    help="reasoning_effort sent to the model, e.g. none/low/high; any value other than none adds "
-                         f".reason-<value> to the EN filename (default: LLM_REASONING_EFFORT, now {REASONING_EFFORT})")
-    ap.add_argument("--transcribe-only", action="store_true",
-                    help="stop after transcription, cleanup and the coverage report")
-    ap.add_argument("--verbose-cleanup", action="store_true", help="print every line the cleanup filters drop")
-    ap.add_argument("--no-vocals", action="store_true",
-                    help="skip vocal separation; transcribe the original audio only")
-    ap.add_argument("--batch-size", type=int, default=BATCH_SIZE,
-                    help=f"lines per translation request (default: {BATCH_SIZE})")
-    ap.add_argument("--no-opensubtitles", action="store_true",
-                    help="don't look for existing subtitles on OpenSubtitles; always transcribe and translate")
-    ap.add_argument("--subs-lang", default=SUBS_LANG,
-                    help="language of the default subtitle track to look for on OpenSubtitles, e.g. en, pt-br "
-                         f"(default: SUBS_LANG from .env, now {SUBS_LANG})")
-    ap.add_argument("--imdb", metavar="ID", help="IMDb id of the movie, or of the episode itself (not the show), "
-                                                 "e.g. tt1234567, for when the filename doesn't identify it")
-    ap.add_argument("--no-original-subs", action="store_true",
-                    help="with OpenSubtitles, don't also look for subtitles in the audio's own language")
-    args = ap.parse_args()
+# ---------------- planning ----------------
+class FileFailed(Exception):
+    """This file can't be processed; the batch carries on with the next one."""
 
-    src = args.input.resolve()
-    # "ABC-123.restored.mp4" shares its subtitle files with "ABC-123.mp4"
-    base = src.stem.removesuffix(".restored")
-    ja_srt = src.with_name(base + ".ja.srt")  # raw Whisper output, cached between runs
-    dossier_path = src.with_name(base + ".dossier.txt")  # context brief, cached and hand-editable
-    en_tag = "." + re.sub(r"[^\w.-]+", "_", args.model) if args.model else ""
-    en_tag += ".nodossier" if args.no_dossier else ""
-    en_srt = src.with_name(f"{base}.en{en_tag}.srt")
-    # Tag the EN file only when --reasoning overrides .env, so A/B runs don't overwrite the normal translation
-    if args.reasoning and args.reasoning != "none" and args.reasoning != REASONING_EFFORT:
-        en_srt = en_srt.with_name(en_srt.name.removesuffix(".srt") + f".reason-{args.reasoning}.srt")
-    REASONING_EFFORT = args.reasoning
 
-    # Existing subtitles first. Skipped when the run is clearly about our own transcript or translation
-    # (--transcribe-only, --en-srt, --model A/B runs). The synced file is cached like ja.srt: delete it to search again.
-    os_tracks = []  # [(srt_path, iso639-2, title)] from OpenSubtitles
-    if not (args.no_opensubtitles or args.transcribe_only or args.en_srt or args.model):
-        os_tracks = existing_subtitles(src, base, args)
-    # Fail on a missing LLM setting now, not after hours of decensoring and transcription
-    llm = None if (args.transcribe_only or args.en_srt or os_tracks) else make_llm(args.model)
+@dataclass
+class Steps:
+    decensor: bool = False
+    smart_subs: bool = False   # --subs: OpenSubtitles, else ASR + translation
+    opensubs: bool = False
+    asr: bool = False
+    translate: bool = False
+    convert: bool = False
 
-    skip_decensor = args.skip_decensor
-    if not skip_decensor and not args.restored and not JASNA_EXE:
-        print("Note: JASNA_EXE isn't set in .env, so the video is subtitled as is, without decensoring.", flush=True)
-        skip_decensor = True
-    decensored = not skip_decensor or args.restored or src.stem.endswith(".restored")
-    final = src.with_name(base + (".decensored.subbed.mkv" if decensored else ".subbed.mkv"))
+    @property
+    def any_subs(self) -> bool:
+        return self.smart_subs or self.opensubs or self.asr or self.translate
 
-    if args.restored:
-        restored = args.restored.resolve()
-    elif skip_decensor:
-        restored = src
-    else:
-        restored = src.with_name(src.stem + ".restored.mp4")
-        free_vram_for_jasna()
-        decensor(src, restored)
 
-    if not restored.exists():
-        sys.exit(f"Video not found: {restored}")
+def resolve_steps(a) -> Steps:
+    s = Steps(decensor=a.decensor, smart_subs=a.subs, opensubs=a.opensubs, asr=a.asr, translate=a.translate,
+              convert=a.convert or bool(a.format) or bool(a.reencode))
+    if a.transcribe_only:  # old flag: Japanese transcript only, as an SRT
+        s.asr, a.no_mux = True, True
+    if a.en_srt:  # old A/B flag: mux these English SRTs instead of translating
+        s.translate = True
+    if a.restored:  # decensored elsewhere: counts as the decensor step
+        s.decensor = True
+    if not (s.decensor or s.any_subs or s.convert):
+        s.smart_subs = True  # no step named: subtitle it the smart way
+    if a.no_opensubtitles and s.smart_subs:  # old flag: smart subtitles without the OpenSubtitles lookup
+        s.smart_subs, s.asr, s.translate = False, True, True
+    return s
 
-    if os_tracks:
-        print("Using existing subtitles; skipping speech recognition and translation.", flush=True)
-        if args.no_mux:
-            return
-        final = args.output.resolve() if args.output else final
-        with tempfile.TemporaryDirectory() as tmp:
-            subs = list(os_tracks)
-            if ja_srt.exists() and not any(lang == "jpn" for _, lang, _ in subs):
-                ja_clean = Path(tmp) / "ja.srt"  # an earlier transcript of this file: add it, cleaned, as before
-                write_srt(clean_cues(read_srt(ja_srt)), ja_clean, "ja")
-                subs.append((ja_clean, "jpn", "Japanese (ASR)"))
-            mux(restored, subs, final, args.keep_subs)
-        print("Done:", final)
-        return
 
-    if ja_srt.exists():
-        print(f"Reusing existing transcript: {ja_srt}", flush=True)
-        cues = read_srt(ja_srt)
-    else:
-        vocals = None
-        if args.no_vocals:
-            pass
-        elif SEPARATOR_EXE.exists():
-            vocals = src.with_name(base + ".vocals.flac")
-            free_vram_for_jasna()  # get the LLM out of VRAM where that's ours to do (see the function)
-            separate_vocals(restored, vocals)
+def is_own_output(p: Path) -> bool:
+    stem = p.stem.lower()
+    return stem.endswith(OUTPUT_STEM_SUFFIXES) or stem.endswith(PARTIAL)
+
+
+def collect_inputs(paths, recursive: bool, exts: set[str], out_dir: Path | None) -> list[tuple[Path, Path]]:
+    """[(video, root)] where root is the folder the user named (the base for --out-dir's mirrored layout)."""
+    found, seen = [], set()
+    for p in paths:
+        p = p.resolve()
+        if p.is_file():
+            items = [(p, p.parent)]  # named explicitly: taken whatever its extension
+        elif p.is_dir():
+            pattern = p.rglob("*") if recursive else p.glob("*")
+            items = [(f, p) for f in sorted(pattern, key=lambda f: str(f).lower())
+                     if f.is_file() and f.suffix.lower() in exts and not is_own_output(f)
+                     and not (out_dir and out_dir in f.parents)]
         else:
-            print(f"Note: {SEPARATOR_EXE} not found; transcribing the original audio only.", flush=True)
-        cues = transcribe(restored, vocals)
-        write_srt(cues, ja_srt, "ja")
-    raw_count = len(cues)
-    cues = clean_cues(cues, verbose=args.verbose_cleanup)
-    coverage_report(cues, media_duration(restored))
-    print(f"{len(cues)} cues to translate ({raw_count - len(cues)} removed by cleanup)", flush=True)
-    if args.transcribe_only:
-        return
+            sys.exit(f"Not found: {p}")
+        for f, root in items:
+            if f not in seen:
+                seen.add(f)
+                found.append((f, root))
+    return found
 
-    en_tracks = []  # [(path, title)]
-    if args.en_srt:
-        for spec in args.en_srt:
-            path_s, _, title = spec.partition("=")
-            path = Path(path_s).resolve()
-            en = read_srt(path)
-            # The EN file must come from this same cleaned transcript, cue for cue
-            if len(en) != len(cues) or any(abs(e["start"] - c["start"]) > 0.01 for e, c in zip(en, cues)):
-                sys.exit(f"{path} has {len(en)} cues that don't line up with the {len(cues)} cleaned JA cues; "
-                         "it was made from a different transcript or cleanup.")
-            en_tracks.append((path, title or "English (machine translation)"))
-            print(f"Using existing English subtitles: {path}", flush=True)
-    else:
-        print(f"Translating with {llm.provider}: {llm.model}", flush=True)
-        we_loaded = False
-        if llm.backend == "lmstudio":
-            ensure_model_loaded(llm.model)
-        elif llm.backend == "tabby":
-            we_loaded = tabby_ensure_loaded(llm)
-        try:
-            dossier = None
-            if not args.no_dossier:
-                title = args.title if args.title is not None else find_title(src, base)
-                dossier = load_or_build_dossier(dossier_path, cues, title, llm)
-            translate(cues, llm, args.batch_size, dossier)
-        finally:
-            if we_loaded:  # leave the shared Tabby server as we found it
-                tabby_unload(llm)
-        write_srt(cues, en_srt, "en")
-        print("Wrote", en_srt, flush=True)
-        en_tracks.append((en_srt, "English (machine translation)"))
-    if args.no_mux:
-        return
 
-    final = args.output.resolve() if args.output else final
-    # Mux the cleaned JA cues so all tracks line up; ja.srt on disk stays the raw cache.
+def output_dir_for(src: Path, root: Path, a) -> Path:
+    if not a.out_dir:
+        return src.parent
+    return a.out_dir if a.flatten else a.out_dir / src.parent.relative_to(root)
+
+
+def output_name(src: Path, base: str, steps: Steps, a, decensored: bool, subbed: bool, out_dir: Path) -> Path:
+    tags = (".decensored" if decensored else "") + (".subbed" if subbed else "")
+    if a.format:
+        ext = "." + a.format
+    elif subbed or steps.convert:
+        ext = ".mkv"
+    else:  # decensor only: keep Jasna's container
+        ext = ".mp4"
+    out = out_dir / f"{base}{tags}{ext}"
+    if out.resolve() == src.resolve():  # converting in place would overwrite the input
+        out = out_dir / f"{base}{tags}.converted{ext}"
+    return out
+
+
+# ---------------- per-file processing ----------------
+class LLMSession:
+    """One LLM client for the whole batch; with LLM_BACKEND=tabby, a model this run loaded is unloaded again."""
+
+    def __init__(self, model: str | None):
+        self.model = model
+        self.llm = None
+        self.we_loaded = False
+
+    def get(self) -> LLM:
+        if self.llm is None:
+            self.llm = make_llm(self.model)
+        if self.llm.backend == "lmstudio":
+            ensure_model_loaded(self.llm.model)
+        elif self.llm.backend == "tabby" and not self.we_loaded:
+            self.we_loaded = tabby_ensure_loaded(self.llm)
+        return self.llm
+
+    def release(self):
+        if self.we_loaded:  # leave the shared Tabby server as we found it
+            tabby_unload(self.llm)
+            self.we_loaded = False
+
+
+def translation_source(work: Path, src: Path, base: str, asr_cues, os_tracks, temps: list):
+    """Japanese cues to translate and where they came from, best first: this run's transcript, an earlier
+    transcript of this file, Japanese subtitles from OpenSubtitles, a Japanese text track in the video."""
+    if asr_cues is not None:
+        return asr_cues, "this run's speech recognition"
+    for p in (work / f"{base}.ja.srt", src.with_name(f"{base}.ja.srt")):
+        if p.exists():
+            return clean_cues(read_srt(p), verbose=False), f"an earlier transcript ({p.name})"
+    for path, lang, _ in os_tracks:
+        if lang == "jpn":
+            return read_srt(path), "Japanese subtitles from OpenSubtitles"
+    embedded = work / f"{base}.ja.embedded.srt"
+    if embedded.exists() or extract_text_subs(src, "jpn", embedded):
+        temps.append(embedded)
+        return read_srt(embedded), "the Japanese subtitle track in the video"
+    return None, None
+
+
+def process_file(src: Path, root: Path, steps: Steps, a, llm_session: LLMSession) -> list[Path]:
+    """Run the requested steps on one video. Returns the final output files."""
+    base = src.stem.removesuffix(".restored")  # "X.restored.mp4" shares its subtitle files with "X.mp4"
+    out_dir = output_dir_for(src, root, a)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    work = out_dir  # intermediates live next to the output, so a kept or failed run can be resumed
+    temps: list[Path] = []  # intermediates to delete once this file succeeds
+    finals: list[Path] = []
+
+    def temp(p: Path) -> Path:
+        temps.append(p)
+        return p
+
+    # 1. Decensor
+    video, decensored = src, src.stem.endswith(".restored")
+    if a.restored:
+        video, decensored = a.restored.resolve(), True
+        if not video.exists():
+            raise FileFailed(f"--restored video not found: {video}")
+    elif steps.decensor:
+        restored = work / f"{base}.restored.mp4"
+        if restored.exists():
+            print(f"Reusing decensored video: {restored}", flush=True)
+        else:
+            free_vram_for_jasna()
+            decensor(src, restored)
+        video, decensored = temp(restored), True
+
+    # 2. Existing subtitles (OpenSubtitles)
+    os_tracks = []
+    if steps.opensubs or steps.smart_subs:
+        os_tracks = existing_subtitles(src, base, work, a)
+        temps.extend(p for p, _, _ in os_tracks)
+    smart_fallback = steps.smart_subs and not os_tracks
+    do_asr = steps.asr or smart_fallback
+    do_translate = steps.translate or (smart_fallback and not a.no_translate_fallback)
+
+    # 3. Speech recognition (Japanese)
+    asr_cues = None
+    ja_srt = work / f"{base}.ja.srt"  # raw Whisper output: the resumable cache
+    if do_asr:
+        legacy = src.with_name(f"{base}.ja.srt")
+        if ja_srt.exists() or legacy.exists():
+            used = ja_srt if ja_srt.exists() else legacy
+            print(f"Reusing existing transcript: {used}", flush=True)
+            raw = read_srt(used)
+            if used == ja_srt:
+                temps.append(ja_srt)
+        else:
+            vocals = None
+            if a.no_vocals:
+                pass
+            elif SEPARATOR_EXE.exists():
+                vocals = temp(work / f"{base}.vocals.flac")
+                free_vram_for_jasna()  # get the LLM out of VRAM where that's ours to do (see the function)
+                separate_vocals(video, vocals)
+            else:
+                print(f"Note: {SEPARATOR_EXE} not found; transcribing the original audio only.", flush=True)
+            raw = transcribe(video, vocals)
+            write_srt(raw, temp(ja_srt), "ja")
+        asr_cues = clean_cues(raw, verbose=a.verbose_cleanup)
+        coverage_report(asr_cues, media_duration(video))
+        print(f"{len(asr_cues)} Japanese lines ({len(raw) - len(asr_cues)} removed by cleanup)", flush=True)
+
+    # 4. Translation (Japanese -> English)
+    mt_tracks = []  # [(srt, title)]
+    if do_translate:
+        en_tag = ("." + re.sub(r"[^\w.-]+", "_", a.model) if a.model else "") + (".nodossier" if a.no_dossier else "")
+        if a.reasoning_tag:
+            en_tag += f".reason-{a.reasoning_tag}"
+        en_srt = work / f"{base}.en{en_tag}.srt"
+        if a.en_srt:
+            for spec in a.en_srt:
+                path_s, _, title = spec.partition("=")
+                mt_tracks.append((Path(path_s).resolve(), title or "English (machine translation)"))
+                print(f"Using existing English subtitles: {mt_tracks[-1][0]}", flush=True)
+        else:
+            cues, origin = translation_source(work, src, base, asr_cues, os_tracks, temps)
+            if cues is None:
+                msg = ("--translate found no Japanese to translate: no transcript, no Japanese subtitles from "
+                       "OpenSubtitles and no Japanese text track in the video. Add --asr (or --opensubs).")
+                if steps.translate:
+                    raise FileFailed(msg)
+                print("Note: " + msg, flush=True)
+            else:
+                cues = [dict(c) for c in cues]  # translate() writes c["en"]; keep the JA cues untouched
+                llm = llm_session.get()
+                print(f"Translating {len(cues)} lines from {origin} with {llm.provider}: {llm.model}", flush=True)
+                dossier = None
+                if not a.no_dossier:
+                    dossier_path = temp(work / f"{base}.dossier.txt")
+                    title = a.title if a.title is not None else find_title(src, base)
+                    dossier = load_or_build_dossier(dossier_path, cues, title, llm)
+                translate(cues, llm, a.batch_size, dossier)
+                if steps.decensor:  # Jasna needs the whole GPU for the next file
+                    llm_session.release()
+                write_srt(cues, temp(en_srt), "en")
+                print("Wrote", en_srt, flush=True)
+                mt_tracks.append((en_srt, "English (machine translation)"))
+
+    # 5. Assemble
+    subs = list(os_tracks) + [(p, "eng", t) for p, t in mt_tracks]
     with tempfile.TemporaryDirectory() as tmp:
-        ja_clean = Path(tmp) / "ja.srt"
-        write_srt(cues, ja_clean, "ja")
-        subs = [(p_, "eng", t) for p_, t in en_tracks] + [(ja_clean, "jpn", "Japanese (ASR)")]
-        mux(restored, subs, final, args.keep_subs)
-    print("Done:", final)
+        if asr_cues is not None:
+            ja_clean = Path(tmp) / "ja.srt"  # mux the cleaned JA cues; ja.srt on disk stays the raw cache
+            write_srt(asr_cues, ja_clean, "ja")
+            subs.append((ja_clean, "jpn", "Japanese (ASR)"))
+        elif os_tracks and not any(lang == "jpn" for _, lang, _ in subs):
+            earlier = next((p for p in (ja_srt, src.with_name(f"{base}.ja.srt")) if p.exists()), None)
+            if earlier:  # an earlier transcript of this file: add it, cleaned, as before
+                ja_clean = Path(tmp) / "ja.srt"
+                write_srt(clean_cues(read_srt(earlier)), ja_clean, "ja")
+                subs.append((ja_clean, "jpn", "Japanese (ASR)"))
+
+        if a.no_mux:
+            # The subtitle files (raw Japanese transcript, English, OpenSubtitles) and a decensored video are the
+            # outputs; keep them
+            finals = [p for p, _, _ in os_tracks] + [p for p, _ in mt_tracks if p.parent == work]
+            if asr_cues is not None and ja_srt.exists():
+                finals.append(ja_srt)
+            if steps.decensor and not a.restored and video != src:
+                finals.append(video)
+            temps = [t for t in temps if t not in finals]
+        elif not subs and not steps.convert and not steps.decensor:
+            print("No subtitles were produced, so there's nothing to write for this file.", flush=True)
+        elif steps.decensor and not subs and not steps.convert and not a.restored:
+            final = output_name(src, base, steps, a, True, False, out_dir)
+            os.replace(video, final)  # decensor only: Jasna's output is the result
+            temps.remove(video)
+            finals = [final]
+        else:
+            final = a.output.resolve() if a.output else output_name(src, base, steps, a, decensored, bool(subs),
+                                                                   out_dir)
+            fmt = a.format or ("mp4" if final.suffix.lower() == ".mp4" else "mkv")
+            mux(video, subs, final, a.keep_subs, existing_from=src, fmt=fmt, reencode=a.reencode, cq=a.cq)
+            finals = [final]
+
+    # 6. Clean up
+    if a.keep_intermediates:
+        if temps:
+            print(f"Kept {len([t for t in temps if t.exists()])} intermediate file(s) (--keep-intermediates)",
+                  flush=True)
+    else:
+        for t in temps:
+            if t.exists() and t not in finals and t.resolve() != src.resolve():
+                t.unlink()
+    return finals
+
+
+# ---------------- CLI ----------------
+EXAMPLES = """\
+steps (combine any of them; with none, --subs is assumed):
+  video.sh movie.mkv                          smart subtitles: OpenSubtitles if it has a good match, else
+                                              speech recognition + translation
+  video.sh X.mp4 --decensor --subs            decensor, then smart subtitles
+  video.sh X.mp4 --decensor                   decensor only (writes X.decensored.mp4)
+  video.sh X.mp4 --asr                        Japanese subtitles only (no LLM)
+  video.sh X.mp4 --asr --translate            always transcribe and translate, even if OpenSubtitles has subs
+  video.sh X.mkv --translate                  translate the Japanese text track already in the file
+  video.sh X.avi --convert                    remux to MKV, nothing else
+  video.sh X.mp4 --reencode hevc --format mkv re-encode to HEVC (NVENC) into an MKV
+batches and output:
+  video.sh "E:/incoming"                      every video in the folder
+  video.sh "E:/incoming" -r --ext mkv,mp4     recurse into subfolders, only .mkv and .mp4
+  video.sh "E:/in" -r --out-dir "F:/done"     write to F:/done, mirroring the folder structure
+  video.sh "E:/in" -r --out-dir F:/done --flatten   everything directly in F:/done
+  video.sh X.mp4 --keep-intermediates         keep the transcript, vocals, decensored video, ...
+
+Files whose output already exists are skipped (--overwrite redoes them). Intermediates are written next to the
+output, deleted when a file succeeds and kept when it fails, so re-running resumes where it stopped.
+"""
+
+
+def parse_args():
+    global REASONING_EFFORT
+    ap = argparse.ArgumentParser(
+        prog="video.sh",
+        description="Decensor, subtitle (OpenSubtitles or speech recognition), translate and convert videos.\n"
+                    "Settings (LLM server, Jasna, OpenSubtitles key) come from .env; see .env.example.",
+        epilog=EXAMPLES, formatter_class=argparse.RawDescriptionHelpFormatter, add_help=False)
+    ap.add_argument("-h", "-?", "--help", action="help", help="show this help, with examples, and exit")
+    ap.add_argument("inputs", nargs="+", type=Path, help="video files and/or folders")
+
+    g = ap.add_argument_group("steps")
+    g.add_argument("--decensor", action="store_true", help="decensor with Jasna (JASNA_EXE in .env)")
+    g.add_argument("--subs", action="store_true",
+                   help="smart subtitles: OpenSubtitles if it has subtitles that sync well, else speech recognition "
+                        "+ translation (the default when no step is named)")
+    g.add_argument("--opensubs", action="store_true",
+                   help="subtitles from OpenSubtitles (OPENSUBTITLES_API_KEY in .env), synced to the audio")
+    g.add_argument("--asr", action="store_true", help="Japanese subtitles by speech recognition (Whisper)")
+    g.add_argument("--translate", action="store_true",
+                   help="English subtitles by LLM translation of the best Japanese source: this run's speech "
+                        "recognition, an earlier transcript, Japanese OpenSubtitles subs, or a Japanese text track "
+                        "in the video")
+    g.add_argument("--convert", action="store_true",
+                   help="write the output in --format (default mkv) even if no other step changes the file")
+
+    g = ap.add_argument_group("input")
+    g.add_argument("-r", "--recursive", action="store_true", help="include videos in subfolders of input folders")
+    g.add_argument("--ext", help="only these extensions when scanning folders, e.g. mp4,mkv (default: common "
+                                 "video types)")
+
+    g = ap.add_argument_group("output")
+    g.add_argument("--out-dir", type=Path, help="write outputs here instead of next to each input; the input "
+                                                "folder structure is mirrored unless --flatten")
+    g.add_argument("--flatten", action="store_true", help="with --out-dir, put every output directly in it")
+    g.add_argument("--output", type=Path, help="exact output file (single input file only)")
+    g.add_argument("--format", choices=("mkv", "mp4"), help="output container (implies --convert; default mkv)")
+    g.add_argument("--reencode", choices=sorted(ENCODERS),
+                   help="re-encode the video (NVENC if available, else CPU); implies --convert. Default: copy")
+    g.add_argument("--cq", type=int, help="quality for --reencode: NVENC CQ or CPU CRF, lower is better (default: "
+                                         "hevc 28 / h264 23 / av1 32 on NVENC)")
+    g.add_argument("--keep-intermediates", action="store_true",
+                   help="keep the transcript, vocals, decensored video, context brief and synced subtitle files "
+                        "(default: delete them once a file succeeds)")
+    g.add_argument("--no-mux", action="store_true",
+                   help="write the subtitle files as the output instead of a video")
+    g.add_argument("--overwrite", action="store_true", help="redo files whose output already exists")
+    g.add_argument("--keep-subs", action="store_true",
+                   help="keep the video's own subtitle tracks, after the new ones (default: drop them)")
+
+    g = ap.add_argument_group("subtitles and translation")
+    g.add_argument("--subs-lang", default=SUBS_LANG,
+                   help=f"language to look for on OpenSubtitles, e.g. en, pt-br (default: SUBS_LANG, now {SUBS_LANG})")
+    g.add_argument("--imdb", metavar="ID", help="IMDb id of the movie or episode, e.g. tt1234567 (single file)")
+    g.add_argument("--no-original-subs", action="store_true",
+                   help="with OpenSubtitles, don't also fetch subtitles in the audio's own language")
+    g.add_argument("--no-translate-fallback", action="store_true",
+                   help="with --subs, fall back to speech recognition only (Japanese subtitles, no LLM)")
+    g.add_argument("--model", help="translation model id (default: LLM_MODEL). With --model, EN subs go to "
+                                   "<name>.en.<model>.srt so A/B runs don't collide")
+    g.add_argument("--reasoning", default=REASONING_EFFORT,
+                   help="reasoning_effort sent to the model, e.g. none (default: LLM_REASONING_EFFORT, now "
+                        f"{REASONING_EFFORT or 'unset'})")
+    g.add_argument("--no-dossier", action="store_true", help="translate without the context brief")
+    g.add_argument("--title", help="video title for the context brief (default: guessed from a sibling file like "
+                                   "'[CODE] Title.mp4')")
+    g.add_argument("--batch-size", type=int, default=BATCH_SIZE, help=f"lines per translation request "
+                                                                      f"(default: {BATCH_SIZE})")
+    g.add_argument("--no-vocals", action="store_true", help="skip vocal separation; transcribe the original audio")
+    g.add_argument("--verbose-cleanup", action="store_true", help="print every line the cleanup filters drop")
+    g.add_argument("--restored", type=Path, help="an already-decensored version of the (single) input, e.g. from "
+                                                 "the Jasna GUI; counts as the decensor step")
+    g.add_argument("--en-srt", action="append", metavar="PATH[=TITLE]",
+                   help="mux this English SRT instead of translating (single file; repeatable for A/B)")
+
+    # Old flags, still accepted
+    ap.add_argument("--skip-decensor", action="store_true", help=argparse.SUPPRESS)  # now the default
+    ap.add_argument("--transcribe-only", action="store_true", help=argparse.SUPPRESS)  # = --asr --no-mux
+    ap.add_argument("--no-opensubtitles", action="store_true", help=argparse.SUPPRESS)  # = --asr --translate
+    if len(sys.argv) == 1:  # no arguments at all: show the full help rather than a one-line error
+        ap.print_help()
+        sys.exit(0)
+    a = ap.parse_args()
+
+    # Tag the EN file only when --reasoning overrides .env, so A/B runs don't overwrite the normal translation
+    a.reasoning_tag = a.reasoning if (a.reasoning and a.reasoning != "none" and a.reasoning != REASONING_EFFORT) \
+        else None
+    REASONING_EFFORT = a.reasoning
+    a.out_dir = a.out_dir.resolve() if a.out_dir else None
+    if a.flatten and not a.out_dir:
+        ap.error("--flatten needs --out-dir")
+    if a.decensor and a.skip_decensor:
+        ap.error("--decensor and --skip-decensor contradict each other")
+    return a
+
+
+def main():
+    a = parse_args()
+    steps = resolve_steps(a)
+    exts = {("." + e.strip().lower().lstrip(".")) for e in a.ext.split(",")} if a.ext else VIDEO_EXTS
+    inputs = collect_inputs(a.inputs, a.recursive, exts, a.out_dir)
+    if not inputs:
+        sys.exit("No videos found" + (" (folders are only scanned one level deep; add -r to recurse)"
+                                      if not a.recursive else "") + ".")
+    single_only = [f for f, v in (("--output", a.output), ("--restored", a.restored), ("--imdb", a.imdb),
+                                  ("--en-srt", a.en_srt)) if v]
+    if single_only and len(inputs) > 1:
+        sys.exit(f"{', '.join(single_only)} only work with a single input file ({len(inputs)} found).")
+
+    # Fail on missing settings now, not after hours of decensoring and transcription
+    if steps.decensor and not a.restored and (not JASNA_EXE or not Path(JASNA_EXE).is_file()):
+        sys.exit("--decensor needs Jasna: set JASNA_EXE in .env to jasna.exe (see README, 'Jasna').")
+    if steps.translate and not a.en_srt:
+        make_llm(a.model)
+    elif steps.smart_subs and not a.no_translate_fallback and (not LLM_BASE_URL or not (a.model or LLM_MODEL)):
+        print("Note: LLM_BASE_URL/LLM_MODEL aren't set, so files without OpenSubtitles matches get Japanese "
+              "subtitles only.", flush=True)
+        a.no_translate_fallback = True
+
+    plan = []
+    for src, root in inputs:
+        base = src.stem.removesuffix(".restored")
+        out_dir = output_dir_for(src, root, a)
+        decensored = steps.decensor or src.stem.endswith(".restored")
+        target = None if a.no_mux else (a.output.resolve() if a.output else
+                                        output_name(src, base, steps, a, decensored, steps.any_subs, out_dir))
+        plan.append((src, root, target))
+    targets = [t for _, _, t in plan if t]
+    dupes = {t for t in targets if targets.count(t) > 1}
+    if dupes:
+        sys.exit("These outputs would collide (same name from different folders; drop --flatten or rename):\n  "
+                 + "\n  ".join(str(d) for d in sorted(dupes)))
+
+    named = [n for n, on in (("decensor", steps.decensor), ("smart subtitles", steps.smart_subs),
+                             ("OpenSubtitles", steps.opensubs), ("speech recognition", steps.asr),
+                             ("translation", steps.translate), ("convert", steps.convert)) if on]
+    print(f"{len(plan)} video(s); steps: {', '.join(named)}", flush=True)
+
+    llm_session = LLMSession(a.model)
+    results = []
+    try:
+        for n, (src, root, target) in enumerate(plan, 1):
+            print(f"\n=== [{n}/{len(plan)}] {src}", flush=True)
+            if target and target.exists() and not a.overwrite:
+                print(f"Skipping: {target} already exists (--overwrite to redo)", flush=True)
+                results.append((src, "skipped", ""))
+                continue
+            t0 = time.time()
+            try:
+                finals = process_file(src, root, steps, a, llm_session)
+                results.append((src, "done", ", ".join(str(f) for f in finals) or "(nothing written)"))
+                print(f"Done in {time.time() - t0:.0f}s: " + (", ".join(str(f) for f in finals) or
+                                                               "nothing written"), flush=True)
+            except (SystemExit, Exception) as e:  # noqa: BLE001 - one bad file mustn't stop the batch
+                if isinstance(e, SystemExit) and e.code in (0, None):
+                    raise
+                msg = str(e.code if isinstance(e, SystemExit) else e)
+                print(f"FAILED: {msg}\nIntermediates were kept, so re-running resumes this file.", flush=True)
+                results.append((src, "failed", msg))
+    finally:
+        llm_session.release()
+
+    if len(results) > 1:
+        print("\n=== Summary", flush=True)
+        for src, status, detail in results:
+            print(f"  {status:8} {src.name}" + (f"  ->  {detail}" if detail else ""), flush=True)
+    if any(s == "failed" for _, s, _ in results):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

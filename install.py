@@ -198,7 +198,7 @@ def final_checks(video: bool, manga: bool):
     todo = []
     if not env.get("LLM_BASE_URL") or not env.get("LLM_MODEL"):
         todo.append("Set LLM_BASE_URL and LLM_MODEL in .env (README: 'Translation model'). Without them you can "
-                    "still make Japanese subtitles (video --transcribe-only).")
+                    "still make Japanese subtitles (video --asr).")
     if video:
         if not shutil.which("ffmpeg"):
             todo.append("Install ffmpeg and put it on PATH (README: 'Other tools').")
