@@ -21,3 +21,7 @@ manga/third_party/mit/result/
 *.dossier.txt
 *.subbed.mkv
 *.restored.mp4
+
+# OpenSubtitles login token (a 24h JWT), cached so batch runs stay under the login rate limit
+.cache/
+*.opensubtitles.srt

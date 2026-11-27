@@ -8,7 +8,7 @@
     uv run install.py --video --cuda cu126 --no-models
 
 What it does, per part:
-  video: .venv-video (Python 3.12): PyTorch (CUDA), faster-whisper, audio-separator; downloads the Whisper
+  video: .venv-video (Python 3.12): PyTorch (CUDA), faster-whisper, audio-separator, ffsubsync, guessit; downloads the Whisper
          large-v3 model (~3 GB) and the vocal-separation model (~900 MB) unless --no-models.
   manga: initializes the manga-image-translator submodule, .venv-manga (Python 3.12): PyTorch (CUDA) and its
          requirements; downloads its detection/OCR/inpainting models (~700 MB) unless --no-models.
@@ -182,7 +182,7 @@ def read_env() -> dict:
                 v = v.split(" #", 1)[0].strip().strip("'\"")
                 env[k.strip()] = re.sub(r"\$\{(\w+)\}", lambda m: os.environ.get(m.group(1), ""), v)
     # Real environment variables override the file, same as in the tools
-    for k in ("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY", "LLM_BACKEND", "JASNA_EXE"):
+    for k in ("LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY", "LLM_BACKEND", "JASNA_EXE", "OPENSUBTITLES_API_KEY"):
         if os.environ.get(k):
             env[k] = os.environ[k]
     return env
@@ -208,6 +208,9 @@ def final_checks(video: bool, manga: bool):
                         "Without it, videos are subtitled as they are.")
         elif not Path(jasna).is_file():
             todo.append(f"JASNA_EXE in .env points to {jasna}, which doesn't exist.")
+        if not env.get("OPENSUBTITLES_API_KEY"):
+            todo.append("Optional: set OPENSUBTITLES_API_KEY in .env to use existing subtitles from OpenSubtitles when "
+                        "there are some, instead of transcribing (README: 'Existing subtitles').")
     if manga:
         seven = shutil.which("7z") or (WIN and Path(r"C:\Program Files\7-Zip\7z.exe").exists())
         if not seven:

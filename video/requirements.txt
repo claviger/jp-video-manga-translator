@@ -10,3 +10,7 @@ ctranslate2==4.8.1
 nvidia-cublas-cu12
 nvidia-cudnn-cu12
 requests
+# Existing subtitles first: ffsubsync (MIT) syncs downloaded subtitles to the audio, guessit (LGPL-3.0) reads the
+# title/season/episode out of the filename for the OpenSubtitles search
+ffsubsync==0.5.1
+guessit==4.5.5
