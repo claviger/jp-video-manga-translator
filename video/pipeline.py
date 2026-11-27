@@ -875,7 +875,8 @@ def existing_subtitles(src: Path, base: str, args) -> list:
     else:
         found = opensubs.find_existing_subtitles(src, langs, args.imdb)
         if primary not in found:
-            print(f"No well-synced {primary_name} subtitles on OpenSubtitles; transcribing instead.", flush=True)
+            if os.environ.get("OPENSUBTITLES_API_KEY"):
+                print(f"No well-synced {primary_name} subtitles on OpenSubtitles; transcribing instead.", flush=True)
             return []
         for lang, f in found.items():
             cached[lang].write_text(f.srt_text, encoding="utf-8")
